@@ -1,0 +1,318 @@
+# ============================================================================
+# OMO (Oh My Ollama) - Comprehensive .gitignore
+# ============================================================================
+
+# ============================================================================
+# Operating Systems
+# ============================================================================
+
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+Icon
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ============================================================================
+# Development & IDEs
+# ============================================================================
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains IDEs
+.idea/
+
+# Vim & Editor swap files
+*.swp
+*.swo
+*.swn
+*.swap
+.*.swp
+.*.swo
+.*.swn
+.*.swap
+.*.kate-swp
+
+# Emacs
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+.#*
+
+# Sublime Text
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+*.sublime-workspace
+*.sublime-project
+
+# ============================================================================
+# Shell & Terminal
+# ============================================================================
+
+# Shell history
+.bash_history
+.bash_sessions/
+.zsh_history
+.zsh_sessions/
+
+# Shell temporary and backup files
+*.sh~
+*.bak
+*.backup
+*.orig
+
+# Log files
+*.log
+*.out
+*.err
+
+# ============================================================================
+# Temporary & Runtime Files
+# ============================================================================
+
+# General temporary files
+*.tmp
+*.temp
+*.pid
+*.lock
+
+# Cache directories
+.cache/
+cache/
+.tmp/
+tmp/
+
+# ============================================================================
+# Docker & Containers
+# ============================================================================
+
+.docker/
+docker-compose.override.yml
+docker-compose.override.yaml
+
+# ============================================================================
+# OMO Project Specific
+# ============================================================================
+
+# Model data directories (these can be large and user-specific)
+# Default directories as defined in omo.sh SCRIPT_DIR variables
+/ollama/
+/hf_download_cache/
+/hf_originals/
+/backups/
+/one-api/
+
+# Alternative naming patterns that might be used
+ollama/
+hf_download_cache/
+hf_originals/
+backups/
+one-api/
+
+# Model files (can be very large)
+*.bin
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.onnx
+*.model
+*.weights
+*.h5
+*.ckpt
+
+# User-specific model configuration (keep template, ignore user configs)
+models.list.user
+models.list.local
+models.list.backup
+models_*.list
+
+# Docker compose overrides (generated files)
+docker-compose.yaml
+docker-compose.yml
+
+# Cache and temporary processing directories
+.hfd/
+*.hfd/
+*.aria2
+
+# Model download related temporary files
+*.part
+*.download
+*.tmp.*
+
+# OMO-specific backup and metadata files
+*.md5
+*_info.txt
+*_original/
+*.original
+*_backup/
+
+# ============================================================================
+# Environment & Secrets
+# ============================================================================
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# API keys and tokens
+secrets.txt
+api_keys.txt
+tokens.txt
+config.local.*
+
+# SSH keys
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pem
+*.key
+
+# GPG keys
+*.gpg
+*.asc
+
+# ============================================================================
+# Archives & Compressed Files
+# ============================================================================
+
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+*.tgz
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+
+# ============================================================================
+# Development Tools (Optional Support)
+# ============================================================================
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.dylib
+*.test
+
+# Testing & Coverage
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+.nyc_output
+coverage/
+
+# Documentation builds
+docs/_build/
+site/
+.mkdocs
+
+# ============================================================================
+# Custom Scripts (Avoid committing personal automation)
+# ============================================================================
+
+run_local.sh
+deploy_local.sh
+my_*.sh
+user_*.sh
+
+# ============================================================================
+# Database Files
+# ============================================================================
+
+*.db
+*.sqlite
+*.sqlite3
+
+# ============================================================================
+# Additional temp patterns
+# ============================================================================
+
+\#*#
+
+# ============================================================================
+# Project Documentation (Exceptions)
+# ============================================================================
+
+# Keep important documentation
+!README.md
+!LICENSE
+!CHANGELOG.md
+!CONTRIBUTING.md
+!docs/
+!examples/

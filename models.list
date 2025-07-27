@@ -1,0 +1,27 @@
+# Models List Template
+# Please modify this file according to your needs and add models you want to download
+# Format: model_type model_name [quantization_type]
+# Model types: ollama, huggingface, or hf-gguf
+# 
+# ==================== IMPORTANT ====================
+# This is a template file, please modify it according to your needs!
+# 1. Uncomment (remove # at the beginning) the models you need
+# 2. Add your own required models
+# ===================================================
+# 
+# ==================== Model Discovery ====================
+# Ollama Models: https://ollama.com/library
+# HuggingFace Models: https://huggingface.co/models
+# HuggingFace GGUF Models: https://huggingface.co/models?library=gguf
+# ========================================================
+# 
+# Ollama model examples (find more at https://ollama.com/library):
+# ollama deepseek-r1:1.5b
+# ollama qwen3:8b
+
+# HuggingFace model examples (find more at https://huggingface.co/models):
+# huggingface microsoft/DialoGPT-medium q4_0
+# huggingface Qwen/Qwen3-0.6B q4_0
+
+# HuggingFace GGUF model examples (find more at https://huggingface.co/models?library=gguf):
+# hf-gguf hf.co/MaziyarPanahi/gemma-3-1b-it-GGUF
