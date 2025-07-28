@@ -3315,8 +3315,7 @@ import_gguf_to_ollama_from_temp() {
     fi
     
     # 创建临时Modelfile
-    local temp_modelfile
-    temp_modelfile=$(mktemp) || {
+    temp_modelfile=$(mktemp) || {  # 移除local使其在cleanup函数中可见
         log_error "Unable to创建临时Modelfile"
         return 1
     }
@@ -3337,14 +3336,16 @@ EOF
     
     # 使用临时容器导入GGUF模型
     log_verbose "启动临时容器导入GGUF模型"
-    local import_name="ollama-import-$$"
+    import_name="ollama-import-$$"  # 移除local使其在cleanup函数中可见
     
     # 定义清理函数
     cleanup_import_container() {
-        if docker ps -a --format "{{.Names}}" | grep -q "^${import_name}$"; then
+        if [[ -n "${import_name:-}" ]] && docker ps -a --format "{{.Names}}" | grep -q "^${import_name}$"; then
             docker rm -f "$import_name" > /dev/null 2>&1
         fi
-        rm -f "$temp_modelfile"
+        if [[ -n "${temp_modelfile:-}" ]] && [[ -f "$temp_modelfile" ]]; then
+            rm -f "$temp_modelfile"
+        fi
     }
     
     
@@ -3364,7 +3365,9 @@ EOF
     
     # 添加卷挂载
     import_cmd+=("-v" "${abs_ollama_dir}:/root/.ollama")
-    import_cmd+=("-p" "11434:11434")  # 使用固定端口映射
+    # 使用随机可用端口避免冲突
+    local random_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+    import_cmd+=("-p" "${random_port}:11434")
     import_cmd+=("$DOCKER_IMAGE_OLLAMA")
     
     if ! "${import_cmd[@]}"; then
