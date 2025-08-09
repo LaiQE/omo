@@ -6,20 +6,16 @@
 # 🤖 功能概览：
 #   📥 模型下载：
 #       • 从Ollama官方仓库下载模型
-#       • 从HuggingFace仓库下载模型并自动转换量化
 #       • 直接下载HuggingFace的GGUF格式模型
 #       • 支持断点续传和缓存复用
-#       • 智能HuggingFace镜像端点检测
 #
 #   💾 模型备份：
 #       • 完整备份Ollama模型（manifest + blobs）
-#       • 备份HuggingFace原始模型文件
 #       • MD5校验确保数据完整性
 #       • 生成详细备份信息文件
 #
 #   🔄 模型恢复：
 #       • 从备份恢复Ollama模型
-#       • 恢复HuggingFace原始模型到缓存
 #       • 支持强制覆盖模式
 #       • 自动验证文件完整性
 #
@@ -43,7 +39,6 @@
 #
 # 📝 支持的模型格式：
 #   • ollama [model]:[tag]     - Ollama官方模型
-#   • huggingface [model] [quant] - HuggingFace模型(需转换)
 #   • hf-gguf [model]:[tag]    - HuggingFace GGUF模型(直接导入)
 #
 # 🔧 环境要求：
@@ -74,18 +69,13 @@ OLLAMA_DATA_DIR="${SCRIPT_DIR}/ollama" # .ollama目录
 OLLAMA_MODELS_DIR="${OLLAMA_DATA_DIR}/models"
 BACKUP_OUTPUT_DIR="${SCRIPT_DIR}/backups"
 HF_DOWNLOAD_CACHE_DIR="${SCRIPT_DIR}/hf_download_cache"
-HF_ORIGINAL_BACKUP_DIR="${SCRIPT_DIR}/hf_originals"
 
 # 预计算的绝对路径（性能优化）
 ABS_OLLAMA_DATA_DIR=""
 ABS_HF_DOWNLOAD_CACHE_DIR=""
-ABS_HF_ORIGINAL_BACKUP_DIR=""
 
-# HuggingFace镜像配置
-HF_ENDPOINT="" # 初始为空，会在需要时动态检测最优端点
 
 # Docker镜像配置
-readonly DOCKER_IMAGE_LLAMA_CPP="ghcr.io/ggml-org/llama.cpp:full-cuda"
 readonly DOCKER_IMAGE_OLLAMA="ollama/ollama:latest"
 readonly DOCKER_IMAGE_ONE_API="justsong/one-api:latest"
 readonly DOCKER_IMAGE_PROMPT_OPTIMIZER="linshen/prompt-optimizer:latest"
@@ -125,181 +115,6 @@ get_host_timezone() {
     fi
 }
 
-#==============================================================================
-# Docker集成模块（HuggingFace模型转换）
-#==============================================================================
-readonly IMAGE_NAME="hf_downloader"
-readonly IMAGE_TAG="latest"
-readonly FULL_IMAGE_NAME="${IMAGE_NAME}:${IMAGE_TAG}"
-
-# Docker集成内容（嵌入式文件）
-# 创建临时构建目录并写入必要文件
-create_docker_build_context() {
-    local build_dir="$1"
-
-    mkdir -p "$build_dir"
-
-    # 获取主机时区
-    local host_timezone=$(get_host_timezone)
-    [[ -z "$host_timezone" ]] && host_timezone="UTC"
-
-    # 写入Dockerfile
-    cat >"$build_dir/Dockerfile" <<EOF
-FROM $DOCKER_IMAGE_LLAMA_CPP
-WORKDIR /app
-ENV DEBIAN_FRONTEND=noninteractive TZ=${host_timezone}
-RUN apt-get update && apt-get install -y --no-install-recommends curl aria2 jq tzdata && \
-    apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
-    ln -snf /usr/share/zoneinfo/${host_timezone} /etc/localtime && echo ${host_timezone} > /etc/timezone && \
-    curl -fsSL https://hf-mirror.com/hfd/hfd.sh -o /app/hfd.sh && chmod +x /app/hfd.sh
-COPY convert_model.sh /app/
-RUN chmod +x /app/convert_model.sh
-ENTRYPOINT ["/app/convert_model.sh"]
-EOF
-
-    # 写入convert_model.sh
-    cat >"$build_dir/convert_model.sh" <<'EOF'
-#!/bin/bash
-set -euo pipefail
-# 简化日志函数（Docker环境专用）
-log_info() { printf "[INFO] %s\n" "$1" >&2; }
-log_success() { printf "[SUCCESS] %s\n" "$1" >&2; }
-log_error() { printf "[ERROR] %s\n" "$1" >&2; }
-run_command() {
-    local description="$1" verbose="$2"
-    shift 2
-    log_info "$description"
-    if [[ "$verbose" == "true" ]]; then
-        "$@"
-    else
-        if "$@" >/dev/null 2>&1; then
-            log_success "${description} completed"
-        else
-            log_error "${description} failed"
-            "$@" 2>&1 | tail -5
-            exit 1
-        fi
-    fi
-}
-download_model() {
-    local model_name="$1" download_dir="$2"
-    # log_info "下载模型: $model_name"
-    if [[ -n "${HF_ENDPOINT:-}" ]]; then
-        export HF_ENDPOINT="${HF_ENDPOINT}"
-    fi
-    local cache_dir="/app/download_cache"
-    if [[ -d "$cache_dir" ]]; then
-        local model_safe_name=$(echo "$model_name" | sed 's/[\/:]/_/g')
-        local cached_model_dir="${cache_dir}/${model_safe_name}"
-        
-        # 检查是否有未完成的下载（存在.aria2文件）
-        if [[ -d "$cached_model_dir" ]] && [[ -n "$(find "$cached_model_dir" -name "*.aria2" 2>/dev/null)" ]]; then
-            log_info "Detected incomplete download, resuming..."
-            export ARIA2C_OPTS="--continue=true --max-tries=10 --retry-wait=3 --split=8 --max-connection-per-server=8 --auto-file-renaming=false"
-            if /app/hfd.sh "$model_name" --local-dir "$cached_model_dir" --tool aria2c; then
-                rm -f "$cached_model_dir"/*.aria2 2>/dev/null || true
-                if [[ -n "$(ls -A "$cached_model_dir" 2>/dev/null)" ]]; then
-                    cp -r "$cached_model_dir"/* "$download_dir"/ 2>/dev/null || true
-                fi
-            else
-                log_error "Model download failed"
-                exit 1
-            fi
-        elif [[ -d "$cached_model_dir" ]] && [[ -n "$(ls -A "$cached_model_dir" 2>/dev/null)" ]]; then
-            log_info "Using cached complete model"
-            if [[ -n "$(ls -A "$cached_model_dir" 2>/dev/null)" ]]; then
-                cp -r "$cached_model_dir"/* "$download_dir"/ 2>/dev/null || true
-            fi
-            return 0
-        else
-            # 全新下载
-            mkdir -p "$cached_model_dir"
-            export ARIA2C_OPTS="--continue=true --max-tries=10 --retry-wait=3 --split=8 --max-connection-per-server=8 --auto-file-renaming=false"
-            if /app/hfd.sh "$model_name" --local-dir "$cached_model_dir" --tool aria2c; then
-                rm -f "$cached_model_dir"/*.aria2 2>/dev/null || true
-                if [[ -n "$(ls -A "$cached_model_dir" 2>/dev/null)" ]]; then
-                    cp -r "$cached_model_dir"/* "$download_dir"/ 2>/dev/null || true
-                fi
-            else
-                log_error "Model download failed"
-                exit 1
-            fi
-        fi
-    else
-        if ! /app/hfd.sh "$model_name" --local-dir "$download_dir" --tool aria2c; then
-            log_error "Model download failed"
-            exit 1
-        fi
-    fi
-}
-convert_to_gguf() {
-    local model_dir="$1" output_file="$2" verbose="$3"
-    run_command "转换为GGUF格式" "$verbose" \
-        python3 /app/convert_hf_to_gguf.py "$model_dir" --outfile "$output_file" --outtype f16
-}
-quantize_model() {
-    local input_file="$1" output_file="$2" quantize_type="$3" verbose="$4"
-    run_command "量化模型 (${quantize_type})" "$verbose" \
-        /app/llama-quantize "$input_file" "$output_file" "$quantize_type"
-    rm -f "$input_file"
-}
-convert_main() {
-    local model_name="" quantize_type="q4_0" gguf_dir="/app/models" verbose=false
-    while [[ $# -gt 0 ]]; do
-        case $1 in
-            --quantize)
-                [[ -z "${2:-}" ]] && { log_error "Missing --quantize parameter value"; exit 1; }
-                quantize_type="$2"; shift 2 ;;
-            --gguf-dir)
-                [[ -z "${2:-}" ]] && { log_error "Missing --gguf-dir parameter value"; exit 1; }
-                gguf_dir="$2"; shift 2 ;;
-            --verbose) verbose=true; shift ;;
-            -*) log_error "Unknown parameter: $1"; exit 1 ;;
-            *)
-                if [[ -z "$model_name" ]]; then
-                    model_name="$1"
-                else
-                    log_error "Extra parameter: $1"; exit 1
-                fi
-                shift ;;
-        esac
-    done
-    if [[ -z "$model_name" ]]; then
-        log_error "Missing model name parameter"; exit 1
-    fi
-    log_info "Processing model: $model_name (${quantize_type})"
-    mkdir -p "$gguf_dir"
-    local temp_dir="/tmp/model_download_$$"
-    mkdir -p "$temp_dir"
-    local model_basename=$(echo "$model_name" | sed 's/\//-/g')
-    local final_gguf_file="${gguf_dir}/${model_basename}-${quantize_type}.gguf"
-    if [[ -f "$final_gguf_file" ]]; then
-        log_info "Output file already exists, skipping conversion"; exit 0
-    fi
-    local temp_gguf_file="${temp_dir}/${model_basename}.gguf"
-    download_model "$model_name" "$temp_dir"
-    convert_to_gguf "$temp_dir" "$temp_gguf_file" "$verbose"
-    quantize_model "$temp_gguf_file" "$final_gguf_file" "$quantize_type" "$verbose"
-    log_success "Conversion completed: $final_gguf_file"
-    if [[ -f "$final_gguf_file" ]]; then
-        local file_size=$(du -h "$final_gguf_file" | cut -f1)
-        log_info "File size: $file_size"
-    fi
-}
-convert_main "$@"
-EOF
-
-    chmod +x "$build_dir/convert_model.sh"
-    log_verbose_success "Docker build context created successfully"
-}
-
-# 清理临时构建目录
-cleanup_docker_build_context() {
-    local build_dir="$1"
-    if [[ -d "$build_dir" ]]; then
-        rm -rf "$build_dir"
-    fi
-}
 
 # 颜色定义
 readonly RED='\033[0;31m'
@@ -347,11 +162,9 @@ backup_single_model() {
         model_to_backup="${BASH_REMATCH[1]}"
     elif [[ "$backup_model" =~ ^ollama:(.+)$ ]]; then
         model_to_backup="${BASH_REMATCH[1]}"
-    elif [[ "$backup_model" =~ ^huggingface:([^:]+):(.+)$ ]]; then
-        # HuggingFace模型需要转换为Ollama格式
-        local model_name="${BASH_REMATCH[1]}"
-        local quantize_type="${BASH_REMATCH[2]}"
-        model_to_backup=$(generate_ollama_model_name "$model_name" "$quantize_type")
+    elif [[ "$backup_model" =~ ^huggingface: ]]; then
+        log_error "HuggingFace models are no longer supported"
+        return 1
     fi
 
     backup_ollama_model "$model_to_backup" "$backup_dir"
@@ -385,11 +198,6 @@ parse_model_entry() {
         result_ref[tag]="${BASH_REMATCH[2]}"
         result_ref[display]="${result_ref[name]}:${result_ref[tag]} (Ollama)"
 
-    elif [[ "$model_entry" =~ ^huggingface:([^:]+):(.+)$ ]]; then
-        result_ref[type]="huggingface"
-        result_ref[name]="${BASH_REMATCH[1]}"
-        result_ref[quantize]="${BASH_REMATCH[2]}"
-        result_ref[display]="${result_ref[name]} (量化: ${result_ref[quantize]})"
 
     elif [[ "$model_entry" =~ ^hf-gguf:(.+)$ ]]; then
         result_ref[type]="hf-gguf"
@@ -417,9 +225,6 @@ check_model_exists() {
     "ollama")
         check_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
         ;;
-    "huggingface")
-        check_huggingface_model_in_ollama "${model_info_ref[name]}" "${model_info_ref[quantize]}"
-        ;;
     "hf-gguf")
         check_hf_gguf_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
         ;;
@@ -436,9 +241,6 @@ download_model() {
     case "${model_info_ref[type]}" in
     "ollama")
         download_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
-        ;;
-    "huggingface")
-        download_huggingface_model "${model_info_ref[name]}" "${model_info_ref[quantize]}"
         ;;
     "hf-gguf")
         download_hf_gguf_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
@@ -459,25 +261,6 @@ try_restore_model() {
         ;;
     "hf-gguf")
         try_restore_ollama_from_backup "${model_info_ref[name]}" "${model_info_ref[tag]}"
-        ;;
-    "huggingface")
-        # HuggingFace模型的恢复逻辑较复杂，先尝试Ollama备份，再尝试原始备份
-        local expected_ollama_name=$(generate_ollama_model_name "${model_info_ref[name]}" "${model_info_ref[quantize]}")
-        local ollama_model_name="${expected_ollama_name%:*}"
-        local ollama_model_tag="${expected_ollama_name#*:}"
-
-        if try_restore_ollama_from_backup "$ollama_model_name" "$ollama_model_tag"; then
-            return 0
-        fi
-
-        # 尝试从原始备份恢复
-        if try_restore_hf_from_original "${model_info_ref[name]}"; then
-            log_verbose "Restoring from original backup, starting conversion..."
-            if restore_and_reconvert_hf_model "${model_info_ref[name]}" "${model_info_ref[quantize]}" "true"; then
-                return 0
-            fi
-        fi
-        return 1
         ;;
     *)
         return 1
@@ -530,104 +313,6 @@ log_verbose_warning() {
     return 0
 }
 
-# HuggingFace端点智能检测函数
-detect_optimal_hf_endpoint() {
-    # 如果已经检测过，直接返回
-    if [[ "$HF_ENDPOINT_DETECTED" == "true" ]]; then
-        return 0
-    fi
-
-    local cache_file="/tmp/.hf_endpoint_cache"
-    local cache_timeout=3600 # 缓存1小时
-
-    # 检查缓存是否有效
-    if [[ -f "$cache_file" ]]; then
-        local cache_time=$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)
-        local current_time=$(date +%s)
-        if [[ $((current_time - cache_time)) -lt $cache_timeout ]]; then
-            HF_ENDPOINT=$(cat "$cache_file")
-            HF_ENDPOINT_DETECTED="true"
-            log_verbose "Using cached HuggingFace endpoint: $HF_ENDPOINT"
-            return 0
-        fi
-    fi
-
-    local hf_official="https://huggingface.co"
-    local hf_mirror="https://hf-mirror.com"
-    local timeout=3
-
-    log_verbose "Detecting optimal HuggingFace endpoint..."
-
-    # 测试单个端点的函数
-    test_endpoint() {
-        local endpoint="$1"
-        local host=$(echo "$endpoint" | sed 's|https\?://||' | cut -d'/' -f1)
-
-        # 使用ping测试连通性和延迟
-        local ping_result=$(ping -c 1 -W $timeout "$host" 2>/dev/null | grep 'time=' | sed 's/.*time=\([0-9.]*\).*/\1/')
-
-        if [[ -n "$ping_result" ]]; then
-            # 将延迟转换为毫秒整数
-            local latency=$(echo "$ping_result" | cut -d'.' -f1)
-            [[ -z "$latency" || ! "$latency" =~ ^[0-9]+$ ]] && latency=0
-            echo "$endpoint|$latency" # 使用 | 分隔符避免与URL中的:冲突
-        else
-            echo "$endpoint|999999" # 表示无法访问
-        fi
-    }
-
-    # 并行测试
-    local official_result="" mirror_result=""
-    {
-        official_result=$(test_endpoint "$hf_official")
-    } &
-    local pid1=$!
-
-    {
-        mirror_result=$(test_endpoint "$hf_mirror")
-    } &
-    local pid2=$!
-
-    # 等待测试完成
-    wait $pid1 $pid2
-
-    # 解析结果
-    local official_latency="${official_result#*|}"
-    local mirror_latency="${mirror_result#*|}"
-
-    # 收集可用端点
-    local available_endpoints=()
-    [[ "$official_latency" != "999999" ]] && available_endpoints+=("$hf_official|$official_latency")
-    [[ "$mirror_latency" != "999999" ]] && available_endpoints+=("$hf_mirror|$mirror_latency")
-
-    # 检查是否有可用端点
-    if [[ ${#available_endpoints[@]} -eq 0 ]]; then
-        log_error "Cannot access any HuggingFace endpoint, script aborted"
-        exit 1
-    fi
-
-    # 选择延迟最低的端点
-    local best_endpoint=""
-    local best_latency=999999
-    for endpoint_info in "${available_endpoints[@]}"; do
-        local endpoint="${endpoint_info%|*}"
-        local latency="${endpoint_info#*|}"
-        if [[ -n "$latency" && "$latency" =~ ^[0-9]+$ && $latency -lt $best_latency ]]; then
-            best_latency=$latency
-            best_endpoint=$endpoint
-        fi
-    done
-
-    local selected_endpoint="$best_endpoint"
-    log_verbose "Selected optimal endpoint: $selected_endpoint (${best_latency}ms)"
-
-    # 更新全局变量并缓存结果
-    HF_ENDPOINT="$selected_endpoint"
-    HF_ENDPOINT_DETECTED="true"
-    echo "$selected_endpoint" >"$cache_file"
-
-    return 0
-}
 
 # 格式化字节大小为人类可读格式
 format_bytes() {
@@ -721,13 +406,8 @@ build_full_docker_cmd() {
         docker_cmd+=("--gpus" "all")
     fi
 
-    # HF Token支持
-    if [[ "$include_hf_token" == "true" && -n "${HF_TOKEN:-}" ]]; then
-        docker_cmd+=("-e" "HF_TOKEN=${HF_TOKEN}")
-    fi
 
     # 基础环境变量
-    docker_cmd+=("-e" "HF_ENDPOINT=${HF_ENDPOINT:-https://hf-mirror.com}")
     docker_cmd+=("-e" "PYTHONUNBUFFERED=1")
     docker_cmd+=("-e" "TERM=xterm-256color")
     docker_cmd+=("-v" "/etc/localtime:/etc/localtime:ro")
@@ -788,8 +468,6 @@ declare -g EXISTING_OLLAMA_CONTAINER=""
 declare -g GLOBAL_CLEANUP_FUNCTIONS=()
 declare -g GLOBAL_CLEANUP_INITIALIZED="false"
 
-# HuggingFace端点检测状态管理
-declare -g HF_ENDPOINT_DETECTED="false"
 
 # 全局清理函数管理
 add_cleanup_function() {
@@ -917,9 +595,7 @@ validate_model_business_integrity() {
     add_cleanup_function "cleanup_temp_business"
 
     # 提取备份文件到临时目录
-    if ! docker run --rm --entrypoint="" -v "$(dirname "$backup_file"):/data" -v "$temp_dir:/temp" hf_downloader:latest sh -c "
-        cd /data && tar -xf '$(basename "$backup_file")' -C /temp 2>/dev/null
-    "; then
+    if ! tar -xf "$backup_file" -C "$temp_dir" 2>/dev/null; then
         log_error "Unable to extract backup file for business logic verification"
         cleanup_temp_business
         return 1
@@ -1076,14 +752,13 @@ parse_model_spec() {
 # 初始化绝对路径
 init_paths() {
     # 获取绝对路径，如果目录不存在则先创建父目录
-    mkdir -p "${OLLAMA_DATA_DIR}" "${HF_DOWNLOAD_CACHE_DIR}" "${HF_ORIGINAL_BACKUP_DIR}" || {
+    mkdir -p "${OLLAMA_DATA_DIR}" "${HF_DOWNLOAD_CACHE_DIR}" || {
         log_error "Unable to create necessary directories"
         return 1
     }
 
     ABS_OLLAMA_DATA_DIR="$(realpath "${OLLAMA_DATA_DIR}")"
     ABS_HF_DOWNLOAD_CACHE_DIR="$(realpath "${HF_DOWNLOAD_CACHE_DIR}")"
-    ABS_HF_ORIGINAL_BACKUP_DIR="$(realpath "${HF_ORIGINAL_BACKUP_DIR}")"
 
 }
 
@@ -1093,11 +768,9 @@ init_paths() {
 
 # Docker helper function - list tar content directly
 
-# Docker文件系统操作辅助函数
+# 文件系统操作辅助函数
 docker_rm_rf() {
     local target_path="$1"
-    local parent_dir
-    local target_name
 
     # 安全检查：防止删除空路径或根目录
     if [[ -z "$target_path" || "$target_path" == "/" ]]; then
@@ -1105,55 +778,17 @@ docker_rm_rf() {
         return 1
     fi
 
-    # 获取父目录和目标名称
-    parent_dir="$(dirname "$target_path")"
-    target_name="$(basename "$target_path")"
-
-    # log_info "使用Docker删除: $target_path"
-
-    # 使用Docker容器以root权限删除文件/目录，覆盖ENTRYPOINT
-    docker run --rm --entrypoint="" \
-        -v "$parent_dir:/work" \
-        "$FULL_IMAGE_NAME" \
-        rm -rf "/work/$target_name" 2>/dev/null
+    # 直接使用系统rm命令
+    rm -rf "$target_path" 2>/dev/null
 }
 
 docker_mkdir_p() {
     local target_path="$1"
-    local parent_dir
-    local target_name
 
-    # 如果目录已存在，直接返回
-    [[ -d "$target_path" ]] && return 0
-
-    # 获取父目录和目标名称
-    parent_dir="$(dirname "$target_path")"
-    target_name="$(basename "$target_path")"
-
-    # 使用Docker容器以root权限创建目录，覆盖ENTRYPOINT
-    if docker run --rm --entrypoint="" --user root \
-        -v "$parent_dir:/work" \
-        "$FULL_IMAGE_NAME" \
-        sh -c "mkdir -p /work/$target_name" 2>/dev/null; then
-        return 0
-    else
-        log_error "Docker directory creation failed: $target_path" >&2
-        return 1
-    fi
+    # 直接使用系统mkdir命令
+    mkdir -p "$target_path" 2>/dev/null
 }
 
-# 确保hf_downloader镜像存在
-ensure_hf_downloader_image() {
-    if ! docker image inspect "$FULL_IMAGE_NAME" &>/dev/null; then
-        log_verbose "Building $FULL_IMAGE_NAME image..."
-        if ! build_docker_image; then
-            log_error "$FULL_IMAGE_NAME image build failed"
-            return 1
-        fi
-        log_verbose_success "$FULL_IMAGE_NAME image build completed"
-    fi
-    return 0
-}
 
 # 确保ollama/ollama镜像存在
 ensure_ollama_image() {
@@ -1221,7 +856,6 @@ start_temp_ollama_container() {
 
     # 构建容器启动命令
     local cmd=("docker" "run" "-d" "--name" "$TEMP_OLLAMA_CONTAINER")
-    cmd+=("-e" "HF_ENDPOINT=${HF_ENDPOINT}")
     cmd+=("--gpus" "all")
     cmd+=("-v" "${ABS_OLLAMA_DATA_DIR}:/root/.ollama")
     cmd+=("-p" "11435:11434") # 使用不同端口避免冲突
@@ -1332,14 +966,11 @@ show_help() {
 选项:
   --models-file FILE    指定模型列表文件 (默认: ./models.list)
   --ollama-dir DIR      指定Ollama数据目录 (默认: ./ollama)
-  --hf-backup-dir DIR   指定HuggingFace原始模型备份目录 (默认: ./hf_originals)
   --backup-dir DIR      备份目录 (默认: ./backups)
   --install             安装/下载模型 (覆盖默认的仅检查行为)
   --check-only          仅检查模型状态，不下载 (默认行为)
   --force-download      强制重新下载所有模型 (自动启用安装模式)
   --verbose             显示详细日志
-  --hf-token TOKEN      HuggingFace访问令牌
-  --rebuild             强制重新构建Docker镜像
   --list                列出已安装的Ollama模型及详细信息
   --backup MODEL        备份指定模型 (格式: 模型名:版本)
   --backup-all          备份所有模型
@@ -1352,25 +983,15 @@ show_help() {
 
 模型列表文件格式:
   ollama deepseek-r1:1.5b
-  huggingface microsoft/DialoGPT-medium q4_0
   hf-gguf hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
 
 下载缓存:
-  HuggingFace模型下载支持断点续传和缓存复用
-  缓存目录: ./hf_download_cache (自动创建)
+  HuggingFace GGUF模型下载支持断点续传和缓存复用
   每个模型有独立的缓存子目录
   中断后重新运行脚本将恢复下载，完成后自动缓存
 
-原始备份:
-  HuggingFace模型转换完成后自动备份原始文件
-  备份目录: ./hf_originals (自动创建)  
-  备份格式: 
 EOF
     cat <<'EOF'
-  备份格式: 目录复制 (模型名_original/)
-  自动生成: MD5校验文件 (模型名_original.md5)
-  备份信息文件: 模型名_original_info.txt (包含文件列表和MD5校验)
-  用途: HuggingFace API调用、重新量化、模型恢复等
 
 Ollama模型备份:
   支持完整的Ollama模型备份和恢复
@@ -1457,57 +1078,6 @@ check_dependencies() {
     return 0
 }
 
-# 构建Docker镜像 - 集成版本
-build_docker_image() {
-    log_verbose "Building Docker image: $FULL_IMAGE_NAME"
-
-    # 创建临时构建目录
-    local temp_build_dir="/tmp/docker_build_$$"
-
-    # 保存当前的trap设置
-    local original_trap
-    original_trap=$(trap -p EXIT | sed "s/trap -- '//" | sed "s/' EXIT//")
-
-    # 设置复合trap - 修复shellcheck SC2089/SC2090
-    if [[ -n "$original_trap" ]]; then
-        trap "cleanup_docker_build_context '$temp_build_dir'; $original_trap" EXIT
-    else
-        trap "cleanup_docker_build_context '$temp_build_dir'" EXIT
-    fi
-
-    # 创建构建上下文
-    create_docker_build_context "$temp_build_dir"
-
-    # 构建支持CUDA的镜像
-    local build_args=()
-    log_verbose "Building CUDA-enabled image, please wait..."
-    build_args+=("--build-arg" "USE_CUDA=true")
-
-    # 执行构建命令
-    local docker_build_cmd=("docker" "build" "${build_args[@]}" "-t" "$FULL_IMAGE_NAME" "$temp_build_dir")
-
-    if "${docker_build_cmd[@]}"; then
-        log_verbose_success "Docker image built successfully: $FULL_IMAGE_NAME"
-        cleanup_docker_build_context "$temp_build_dir"
-        # 恢复原始trap
-        if [[ -n "$original_trap" ]]; then
-            trap '$original_trap' EXIT
-        else
-            trap - EXIT
-        fi
-        return 0
-    else
-        log_error "Failed to build Docker image"
-        cleanup_docker_build_context "$temp_build_dir"
-        # 恢复原始trap
-        if [[ -n "$original_trap" ]]; then
-            trap '$original_trap' EXIT
-        else
-            trap - EXIT
-        fi
-        exit 1
-    fi
-}
 
 # 解析模型列表文件
 parse_models_list() {
@@ -1529,7 +1099,7 @@ parse_models_list() {
         read -r model_type model_name quantization <<<"$line"
 
         if [[ -n "$model_type" && -n "$model_name" ]]; then
-            if [[ "$model_type" == "ollama" || "$model_type" == "huggingface" || "$model_type" == "hf-gguf" ]]; then
+            if [[ "$model_type" == "ollama" || "$model_type" == "hf-gguf" ]]; then
                 # 如果有量化类型，添加到模型信息中
                 if [[ -n "$quantization" ]]; then
                     models_array+=("$model_type:$model_name:$quantization")
@@ -1559,7 +1129,6 @@ parse_models_list() {
         log_warning ""
         log_warning "Examples:"
         log_warning "  ollama deepseek-r1:1.5b"
-        log_warning "  huggingface Qwen/Qwen3-0.6B q4_0"
         log_warning "  hf-gguf hf.co/MaziyarPanahi/gemma-3-1b-it-GGUF"
         log_warning "====================================================================="
         echo
@@ -1584,20 +1153,6 @@ check_hf_gguf_model() {
     return 1
 }
 
-# 生成Ollama模型名称
-generate_ollama_model_name() {
-    local model_name="$1"
-    local quantize_type="$2"
-
-    # 清理量化类型
-    local clean_quant=$(echo "${quantize_type}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
-
-    # 使用统一的命名函数进行Ollama模型名称转换
-    local full_name_clean=$(get_safe_model_name "$model_name" "ollama")
-
-    # 为从HuggingFace下载的模型添加识别前缀和量化后缀
-    echo "hf-${full_name_clean}:${clean_quant}"
-}
 
 # 下载Ollama模型
 download_ollama_model() {
@@ -1963,9 +1518,6 @@ verify_integrity() {
     "backup")
         _verify_backup_target "$target" "$model_spec" "$use_cache" "$check_blobs"
         ;;
-    "hf_model")
-        _verify_hf_model "$target" "$check_blobs"
-        ;;
     "backup_file")
         _verify_backup_file "$target" "$use_cache"
         ;;
@@ -2067,29 +1619,7 @@ _verify_backup_target() {
     return 1
 }
 
-# 内部函数：验证HuggingFace模型
-_verify_hf_model() {
-    local source_dir="$1"
-    local check_files="$2"
-
-    # 检查源目录是否存在
-    [[ ! -d "$source_dir" ]] && return 1
-
-    # 如果不需要检查文件，只验证目录存在
-    [[ "$check_files" == "false" ]] && return 0
-
-    # 检查必要的文件
-    local has_model_files=false
-    for ext in safetensors bin gguf; do
-        if ls "$source_dir"/*."$ext" >/dev/null 2>&1; then
-            has_model_files=true
-            break
-        fi
-    done
-
-    [[ "$has_model_files" == "false" ]] && return 1
-    return 0
-}
+# 内部函数：验证模型文件完整性
 
 # 内部函数：验证备份文件（业务逻辑完整性）
 _verify_backup_file() {
@@ -2173,45 +1703,6 @@ get_backup_base_path() {
     echo "${backup_dir}/${model_safe_name}${suffix}"
 }
 
-# 创建tar文件的通用函数（用于HuggingFace模型）
-create_hf_tar_file() {
-    local output_file="$1"
-    local source_dir="$2"
-
-    # 创建排除文件列表
-    local temp_exclude="/tmp/tar_exclude_$$.txt"
-    cat >"$temp_exclude" <<'EOF'
-*.aria2
-*.tmp
-*.part
-EOF
-
-    # 使用Docker创建tar文件
-    local output_dir="$(dirname "$output_file")"
-    local output_basename="$(basename "$output_file")"
-    local source_parent="$(dirname "$source_dir")"
-    local source_name="$(basename "$source_dir")"
-
-    # 确保hf_downloader镜像存在
-    ensure_hf_downloader_image || {
-        rm -f "$temp_exclude"
-        return 1
-    }
-
-    if docker run --rm --entrypoint="" \
-        -v "$source_parent:/source:ro" \
-        -v "$output_dir:/output" \
-        -v "$temp_exclude:/exclude.txt:ro" \
-        "$FULL_IMAGE_NAME" \
-        tar -cf "/output/$output_basename" -C /source --exclude-from=/exclude.txt "$source_name" 2>/dev/null; then
-        rm -f "$temp_exclude"
-        return 0
-    else
-        log_error "Failed to create tar file: $output_file"
-        rm -f "$temp_exclude"
-        return 1
-    fi
-}
 
 # 备份信息和管理函数
 
@@ -2296,8 +1787,6 @@ EOF
   cp -r "$(basename "$backup_dir")/manifests/"* "\$OLLAMA_MODELS_DIR/manifests/"
   cp "$(basename "$backup_dir")/blobs/"* "\$OLLAMA_MODELS_DIR/blobs/"
   
-  # 手动恢复（HuggingFace模型）
-  cp -r "$(basename "$backup_dir")" "\$HF_DOWNLOAD_CACHE_DIR/"
 
 EOF
     else
@@ -2319,7 +1808,6 @@ EOF
 2. 检查备份结构:
    - 确保备份目录包含完整的文件结构
    - 对于Ollama模型: manifests/ 和 blobs/ 目录
-   - 对于HuggingFace模型: 模型文件和配置文件
 
 备份特性:
    - 直接复制: 极快的备份和恢复速度，无需压缩/解压缩
@@ -2345,73 +1833,6 @@ EOF
     fi
 }
 
-# 创建HuggingFace原始模型备份（直接复制）
-backup_hf_original_model() {
-    local model_name="$1"
-    local source_dir="$2"
-
-    log_info "Backing up model: $model_name"
-    log_verbose "Source directory: $source_dir"
-
-    # Check if source directory exists
-    if [[ ! -d "$source_dir" ]]; then
-        log_error "Source directory does not exist: $source_dir"
-        return 1
-    fi
-
-    # Check local model integrity
-    log_info "Checking model integrity..."
-    if ! verify_integrity "hf_model" "$source_dir" "check_files:true"; then
-        log_error "Local model is incomplete, backup operation cancelled"
-        return 1
-    fi
-
-    # Create backup directory and path
-    local model_backup_dir
-    model_backup_dir=$(create_model_backup_dir "$model_name" "$ABS_HF_ORIGINAL_BACKUP_DIR") || return 1
-    local model_safe_name=$(get_safe_model_name "$model_name")
-    local backup_dir="$model_backup_dir/${model_safe_name}_original"
-
-    # Check if backup directory already exists
-    if [[ -d "$backup_dir" ]]; then
-        log_info "Model backup already exists"
-        return 0
-    fi
-
-    log_verbose "Model backup directory: $backup_dir"
-
-    # Calculate source directory size
-    local source_size_human=$(get_file_size_human "$source_dir")
-    log_verbose "Source directory size: $source_size_human"
-
-    # Copy source directory to backup directory, excluding .hfd temp directory
-    log_info "Copying model files..."
-    mkdir -p "$backup_dir"
-    if rsync -av --exclude='.hfd' "$source_dir/" "$backup_dir/" 2>/dev/null || {
-        # If rsync is not available, use cp with manual exclusion
-        log_verbose "rsync not available, using cp (excluding .hfd directory)"
-        (cd "$source_dir" && find . -type d -name '.hfd' -prune -o -type f -print0 | cpio -0pdm "$backup_dir/") 2>/dev/null
-    }; then
-        # Calculate MD5 checksum
-        log_verbose "Calculating MD5 checksum..."
-        local md5_file="${backup_dir}.md5"
-        if calculate_directory_md5 "$backup_dir" "$md5_file"; then
-            log_verbose "MD5 checksum file created: $md5_file"
-        else
-            log_warning "Failed to create MD5 checksum file"
-        fi
-
-        # Create backup info file
-        create_backup_info "$model_name" "${model_backup_dir}/${model_safe_name}" "directory" 1 "original"
-
-        log_success "HuggingFace original model backup completed: $model_name"
-        return 0
-    else
-        log_error "Failed to copy files"
-        rm -rf "$backup_dir" 2>/dev/null
-        return 1
-    fi
-}
 
 # 列出已安装的Ollama模型及详细信息
 list_installed_models() {
@@ -2740,11 +2161,9 @@ remove_model_smart() {
             fi
         fi
 
-        # 检查是否是GGUF模型（生成的Ollama模型名）
-        local generated_name=$(generate_ollama_model_name "$model_name" "$model_tag_or_quant")
-
-        # 统一删除处理
-        if remove_ollama_model "$generated_name" "$force_delete"; then
+        # HuggingFace models are no longer supported
+        log_error "HuggingFace models are no longer supported"
+        if remove_ollama_model "$model_name:$model_tag_or_quant" "$force_delete"; then
             return 0
         else
             return 1
@@ -2830,36 +2249,22 @@ restore_ollama_model() {
         fi
     fi
 
-    # 使用Docker确保目标目录存在并有正确权限
-    ensure_hf_downloader_image || return 1
-
-    # 使用Docker创建Ollama目录并设置权限
-    if ! docker run --rm --entrypoint="" --user root \
-        -v "$OLLAMA_MODELS_DIR:/ollama" \
-        "$FULL_IMAGE_NAME" \
-        sh -c "mkdir -p /ollama/manifests /ollama/blobs"; then
+    # 创建Ollama目录并设置权限
+    if ! mkdir -p "$OLLAMA_MODELS_DIR/manifests" "$OLLAMA_MODELS_DIR/blobs"; then
         log_error "Unable to创建Ollama目录"
         return 1
     fi
 
     # 复制manifests
     log_verbose "恢复模型信息..."
-    if ! docker run --rm --entrypoint="" --user root \
-        -v "$backup_dir:/backup" \
-        -v "$OLLAMA_MODELS_DIR:/ollama" \
-        "$FULL_IMAGE_NAME" \
-        sh -c "cp -r /backup/manifests/* /ollama/manifests/"; then
+    if ! cp -r "$backup_dir/manifests/"* "$OLLAMA_MODELS_DIR/manifests/"; then
         log_error "manifest文件复制失败"
         return 1
     fi
 
     # 复制blobs
     log_verbose "恢复模型数据..."
-    if ! docker run --rm --entrypoint="" --user root \
-        -v "$backup_dir:/backup" \
-        -v "$OLLAMA_MODELS_DIR:/ollama" \
-        "$FULL_IMAGE_NAME" \
-        sh -c "cp /backup/blobs/* /ollama/blobs/"; then
+    if ! cp "$backup_dir/blobs/"* "$OLLAMA_MODELS_DIR/blobs/"; then
         log_error "blob文件复制失败"
         return 1
     fi
@@ -2959,26 +2364,9 @@ backup_models_from_list() {
                 ((failed++))
             fi
 
-        elif [[ "$model" =~ ^huggingface:([^:]+):(.+)$ ]]; then
-            local model_name="${BASH_REMATCH[1]}"
-            local quantize_type="${BASH_REMATCH[2]}"
-
-            log_verbose "备份HuggingFace模型: $model_name (量化: $quantize_type)"
-
-            # 检查HuggingFace模型是否存在于Ollama中
-            if check_huggingface_model_in_ollama "$model_name" "$quantize_type"; then
-                local ollama_model_name=$(generate_ollama_model_name "$model_name" "$quantize_type")
-                if backup_ollama_model "$ollama_model_name" "$backup_dir"; then
-                    ((success++))
-                    log_verbose_success "HuggingFace模型备份成功: $model_name"
-                else
-                    ((failed++))
-                    log_error "HuggingFace模型备份失败: $model_name"
-                fi
-            else
-                log_warning "HuggingFace模型不存在，跳过备份: $model_name"
-                ((failed++))
-            fi
+        elif [[ "$model" =~ ^huggingface: ]]; then
+            log_error "HuggingFace models are no longer supported"
+            ((failed++))
 
         else
             log_error "无效的模型条目格式: $model"
@@ -3087,21 +2475,9 @@ remove_models_from_list() {
                 log_error "Ollama模型删除失败: $model_spec"
             fi
 
-        elif [[ "$model" =~ ^huggingface:([^:]+):(.+)$ ]]; then
-            local model_name="${BASH_REMATCH[1]}"
-            local quantize_type="${BASH_REMATCH[2]}"
-
-            log_verbose "删除HuggingFace GGUF模型: $model_name ($quantize_type)"
-
-            # 生成对应的Ollama模型名称
-            local ollama_model_name=$(generate_ollama_model_name "$model_name" "$quantize_type")
-            if remove_ollama_model "$ollama_model_name" "true"; then
-                ((success++))
-                log_verbose_success "GGUF模型删除成功: $model_name ($quantize_type)"
-            else
-                ((failed++))
-                log_error "GGUF模型删除失败: $model_name ($quantize_type)"
-            fi
+        elif [[ "$model" =~ ^huggingface: ]]; then
+            log_error "HuggingFace models are no longer supported"
+            ((failed++))
 
         elif [[ "$model" =~ ^hf-gguf:(.+)$ ]]; then
             local model_full_name="${BASH_REMATCH[1]}"
@@ -3150,405 +2526,11 @@ remove_models_from_list() {
 }
 
 # 检查Ollama中是否存在指定模型
-# 检查HuggingFace模型是否已存在于Ollama中（智能匹配）
-check_huggingface_model_in_ollama() {
-    local model_name="$1"
-    local quantize_type="$2"
 
-    log_verbose "检查HuggingFace模型: $model_name ($quantize_type)"
-
-    # 生成期望的Ollama模型名称（带hf-前缀）
-    local expected_ollama_name=$(generate_ollama_model_name "$model_name" "$quantize_type")
-
-    # 使用简化的容器检查
-    if check_ollama_model_exists "$expected_ollama_name"; then
-        log_verbose_success "找到匹配的Ollama模型: $expected_ollama_name"
-        return 0
-    fi
-
-    log_verbose_warning "未找到匹配的Ollama模型: $expected_ollama_name"
-    return 1
-}
-
-# 从HuggingFace原始备份恢复并重新转换
-restore_and_reconvert_hf_model() {
-    local model_name="$1"
-    local quantize_type="$2"
-    local skip_md5_check="${3:-false}" # 新增参数，默认为false
-
-    log_info "从原始备份恢复并重新转换: $model_name ($quantize_type)"
-
-    # 生成文件系统安全的模型名称
-    local model_safe_name=$(get_safe_model_name "$model_name" "filesystem")
-    local model_backup_dir="${ABS_HF_ORIGINAL_BACKUP_DIR}/${model_safe_name}"
-    local backup_dir="${model_backup_dir}/${model_safe_name}_original"
-
-    # 检查备份目录
-    if [[ ! -d "$backup_dir" ]]; then
-        log_verbose_warning "未找到备份目录: $backup_dir"
-        return 1
-    fi
-
-    # MD5校验（如果没有跳过的话）
-    if [[ "$skip_md5_check" != "true" ]]; then
-        local md5_file="${backup_dir}.md5"
-        if [[ -f "$md5_file" ]]; then
-            log_info "正在验证MD5校验值..."
-            if verify_directory_md5 "$backup_dir" "$md5_file"; then
-                log_verbose_success "MD5校验通过"
-            else
-                log_error "MD5校验失败，备份可能已损坏"
-                return 1
-            fi
-        else
-            log_warning "未找到MD5校验文件，跳过校验"
-        fi
-    fi
-
-    # 创建临时目录进行恢复
-    local restore_temp_dir=$(mktemp -d) || {
-        log_error "无法创建临时目录"
-        return 1
-    }
-
-    cleanup_restore_temp() { [[ -d "${restore_temp_dir:-}" ]] && rm -rf "$restore_temp_dir"; }
-    add_cleanup_function "cleanup_restore_temp"
-
-    # 直接复制备份目录到临时目录
-    log_info "恢复模型文件..."
-    local restored_model_dir="$restore_temp_dir/restored_model"
-    if ! cp -r "$backup_dir" "$restored_model_dir"; then
-        log_error "备份恢复失败"
-        cleanup_restore_temp
-        remove_cleanup_function "cleanup_restore_temp"
-        return 1
-    fi
-
-    # 将恢复的模型复制到缓存目录供转换脚本使用
-    local cache_model_dir="${ABS_HF_DOWNLOAD_CACHE_DIR}/${model_safe_name}"
-
-    # 清理旧缓存并复制恢复的模型
-    [[ -d "$cache_model_dir" ]] && rm -rf "$cache_model_dir"
-    if ! cp -r "$restored_model_dir" "$cache_model_dir"; then
-        log_error "模型复制失败"
-        cleanup_restore_temp
-        remove_cleanup_function "cleanup_restore_temp"
-        return 1
-    fi
-
-    # 构建并执行转换命令，直接使用restore_temp_dir作为输出目录
-    local container_name="llm-reconvert-$$"
-    local docker_cmd=()
-    mapfile -t docker_cmd < <(build_full_docker_cmd "$container_name" "true" "false" \
-        --volume "${restore_temp_dir}:/app/models" \
-        --volume "${ABS_HF_DOWNLOAD_CACHE_DIR}:/app/download_cache")
-
-    [[ ${#docker_cmd[@]} -eq 0 ]] && {
-        log_error "Docker命令构建失败"
-        return 1
-    }
-
-    docker_cmd+=("${FULL_IMAGE_NAME}" "${model_name}" "--quantize" "${quantize_type}" "--gguf-dir" "/app/models")
-    [[ "${VERBOSE}" == "true" ]] && docker_cmd+=("--verbose")
-
-    # 执行转换
-    local conversion_result=0
-    log_info "开始重新转换模型..."
-
-    if "${docker_cmd[@]}" >/dev/null 2>&1; then
-        # 导入到Ollama，使用restore_temp_dir查找GGUF文件
-        if import_gguf_to_ollama_from_temp "$model_name" "$quantize_type" "$restore_temp_dir"; then
-            log_success "模型恢复、转换并导入完成: $model_name"
-            conversion_result=0
-        else
-            log_error "转换成功但导入Ollama失败"
-            conversion_result=1
-        fi
-    else
-        log_error "模型转换失败: $model_name"
-        conversion_result=1
-    fi
-
-    # 清理缓存
-    [[ -d "$cache_model_dir" ]] && rm -rf "$cache_model_dir" 2>/dev/null
-    cleanup_restore_temp
-    remove_cleanup_function "cleanup_restore_temp"
-
-    return $conversion_result
-}
 
 # 检查Ollama中是否存在指定模型（通用函数）
 
-# 从临时目录导入GGUF模型到Ollama
-import_gguf_to_ollama_from_temp() {
-    local model_name="$1"
-    local quantize_type="$2"
-    local temp_dir="$3"
 
-    log_verbose "开始从临时目录导入GGUF模型到Ollama: $model_name ($quantize_type)"
-
-    # 查找临时目录中的GGUF文件
-    local gguf_file=$(find "$temp_dir" -name "*.gguf" -type f | head -n1)
-    if [[ ! -f "$gguf_file" ]]; then
-        log_error "在临时目录中未找到GGUF文件: $temp_dir"
-        return 1
-    fi
-
-    log_info "找到GGUF文件: $gguf_file"
-
-    # 生成Ollama模型名称（带hf-前缀）
-    local ollama_model_name=$(generate_ollama_model_name "$model_name" "$quantize_type")
-    log_verbose "Ollama模型名称: $ollama_model_name"
-
-    # 检查模型是否已存在于Ollama中
-    if check_ollama_model_exists "$ollama_model_name"; then
-        log_success "模型已存在于Ollama中，跳过导入: $ollama_model_name"
-        return 0
-    fi
-
-    # 创建临时Modelfile
-    temp_modelfile=$(mktemp) || { # 移除local使其在cleanup函数中可见
-        log_error "Unable to创建临时Modelfile"
-        return 1
-    }
-    cat >"$temp_modelfile" <<EOF
-FROM ${gguf_file}
-TEMPLATE """{{ if .System }}<|im_start|>system
-{{ .System }}<|im_end|>
-{{ end }}{{ if .Prompt }}<|im_start|>user
-{{ .Prompt }}<|im_end|>
-{{ end }}<|im_start|>assistant
-"""
-PARAMETER stop "<|im_end|>"
-PARAMETER temperature 0.7
-PARAMETER top_p 0.9
-EOF
-
-    log_verbose "创建Modelfile: $temp_modelfile"
-
-    # 使用临时容器导入GGUF模型
-    log_verbose "启动临时容器导入GGUF模型"
-    import_name="ollama-import-$$" # 移除local使其在cleanup函数中可见
-
-    # 定义清理函数
-    cleanup_import_container() {
-        if [[ -n "${import_name:-}" ]] && docker ps -a --format "{{.Names}}" | grep -q "^${import_name}$"; then
-            docker rm -f "$import_name" >/dev/null 2>&1
-        fi
-        if [[ -n "${temp_modelfile:-}" ]] && [[ -f "$temp_modelfile" ]]; then
-            rm -f "$temp_modelfile"
-        fi
-    }
-
-    # 设置信号处理
-    add_cleanup_function "cleanup_import_container"
-
-    # 获取绝对路径
-    local abs_ollama_dir
-    # 对于Ollama容器，需要挂载的是.ollama目录（即data目录），而不是data/models
-    abs_ollama_dir="$ABS_OLLAMA_DATA_DIR"
-
-    # 启动临时容器
-    local import_cmd=("docker" "run" "-d" "--name" "$import_name")
-
-    # 添加GPU配置
-    import_cmd+=("--gpus" "all")
-
-    # 添加卷挂载
-    import_cmd+=("-v" "${abs_ollama_dir}:/root/.ollama")
-    # 使用随机可用端口避免冲突
-    local random_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
-    import_cmd+=("-p" "${random_port}:11434")
-    import_cmd+=("$DOCKER_IMAGE_OLLAMA")
-
-    if ! "${import_cmd[@]}"; then
-        log_error "Unable to启动临时导入容器"
-        rm -f "$temp_modelfile"
-        return 1
-    fi
-
-    # 等待服务就绪
-    local max_attempts=30
-    local attempt=0
-
-    while ((attempt < max_attempts)); do
-        if docker exec "$import_name" ollama list >/dev/null 2>&1; then
-            break
-        fi
-        sleep 2
-        ((attempt++))
-    done
-
-    if ((attempt >= max_attempts)); then
-        log_error "等待导入容器服务超时"
-        docker rm -f "$import_name" >/dev/null 2>&1
-        rm -f "$temp_modelfile"
-        return 1
-    fi
-
-    # 将GGUF文件和Modelfile复制到容器中
-    local container_gguf_path="/tmp/$(basename "$gguf_file")"
-    local container_modelfile="/tmp/Modelfile-$$"
-
-    if ! docker cp "$gguf_file" "$import_name:$container_gguf_path"; then
-        log_error "Unable to将GGUF文件复制到容器"
-        docker rm -f "$import_name" >/dev/null 2>&1
-        rm -f "$temp_modelfile"
-        return 1
-    fi
-
-    # 更新Modelfile中的路径为容器内路径
-    sed -i "s|FROM .*|FROM $container_gguf_path|" "$temp_modelfile"
-
-    if ! docker cp "$temp_modelfile" "$import_name:$container_modelfile"; then
-        log_error "Unable to将Modelfile复制到容器"
-        docker rm -f "$import_name" >/dev/null 2>&1
-        rm -f "$temp_modelfile"
-        return 1
-    fi
-
-    # 在容器中执行ollama create命令
-    log_verbose "执行命令: docker exec $import_name ollama create $ollama_model_name -f $container_modelfile"
-    local result=1
-    if docker exec "$import_name" ollama create "$ollama_model_name" -f "$container_modelfile"; then
-        log_success "GGUF模型已导入Ollama: $ollama_model_name"
-        result=0
-    else
-        log_error "GGUF模型导入失败: $ollama_model_name"
-    fi
-
-    # 清理容器和临时文件
-    cleanup_import_container
-    remove_cleanup_function "cleanup_import_container"
-
-    return $result
-}
-
-# 下载并转换HuggingFace模型
-download_huggingface_model() {
-    local model_name="$1"
-    local quantize_type="$2"
-
-    log_info "开始下载并转换HuggingFace模型: $model_name (量化: $quantize_type)"
-
-    # 检测最优HuggingFace端点
-    detect_optimal_hf_endpoint
-
-    # 如果原始备份恢复失败，进行正常的下载流程
-
-    # 创建临时目录用于存储GGUF文件
-    local temp_dir
-    temp_dir=$(mktemp -d) || {
-        log_error "Unable to创建临时目录"
-        return 1
-    }
-
-    # 定义清理函数
-    cleanup_temp_dir() {
-        if [[ -d "${temp_dir:-}" ]]; then
-            log_verbose "清理临时目录: $temp_dir"
-            docker_rm_rf "$temp_dir"
-        fi
-    }
-
-    # 定义容器清理函数
-    cleanup_converter_container() {
-        local container_name="llm-converter-$$"
-        if docker ps -a --format "{{.Names}}" | grep -q "^${container_name}$"; then
-            log_warning "检测到中断，正在停止并清理转换容器: $container_name"
-            docker stop "$container_name" >/dev/null 2>&1
-            docker rm -f "$container_name" >/dev/null 2>&1
-        fi
-        cleanup_temp_dir
-    }
-
-    # 设置信号处理，确保容器被正确清理
-    add_cleanup_function "cleanup_converter_container"
-
-    # 构建docker run命令，使用指定的容器名
-    local container_name="llm-converter-$$"
-    mapfile -t docker_cmd < <(build_full_docker_cmd "$container_name" "true" "true" \
-        --volume "$temp_dir:/app/models" \
-        --volume "${ABS_HF_DOWNLOAD_CACHE_DIR}:/app/download_cache")
-
-    # 镜像和参数
-    docker_cmd+=("${FULL_IMAGE_NAME}")
-    docker_cmd+=("${model_name}")
-    docker_cmd+=("--quantize" "${quantize_type}")
-    docker_cmd+=("--gguf-dir" "/app/models")
-
-    # 添加verbose参数支持
-    if [[ "${VERBOSE}" == "true" ]]; then
-        docker_cmd+=("--verbose")
-    fi
-
-    # 执行转换命令，使用实时输出
-    local conversion_result=0
-    log_info "正在下载和转换模型..."
-    echo "----------------------------------------"
-
-    # 使用 unbuffer 或者直接管道输出来确保实时显示
-    if "${docker_cmd[@]}" 2>&1 | while IFS= read -r line; do
-        echo "[HF-DOCKER] $line"
-    done; then
-        echo "----------------------------------------"
-        log_success "HuggingFace模型下载并转换完成: $model_name"
-
-        # 自动导入到Ollama
-        log_info "开始导入GGUF模型到Ollama..."
-        local ollama_model_name=$(generate_ollama_model_name "$model_name" "$quantize_type")
-        if import_gguf_to_ollama_from_temp "$model_name" "$quantize_type" "$temp_dir"; then
-            log_success "模型已成功导入到Ollama: $ollama_model_name"
-
-            # 验证导入后的模型完整性
-            local final_model_name="${ollama_model_name%:*}"
-            local final_model_tag="${ollama_model_name#*:}"
-            if verify_model_after_installation "$final_model_name" "$final_model_tag"; then
-                log_verbose_success "模型完整性验证通过: $ollama_model_name"
-            else
-                log_error "模型完整性验证失败，模型已被清理: $ollama_model_name"
-            fi
-
-            # 新流程：在导入成功后进行备份和清理
-            # 步骤1: 创建原始模型备份
-            log_info "创建原始模型备份..."
-            local model_safe_name=$(get_safe_model_name "$model_name" "filesystem")
-            local cache_dir="${ABS_HF_DOWNLOAD_CACHE_DIR}/${model_safe_name}"
-
-            # 检查是否存在缓存目录
-            if [[ -d "$cache_dir" ]]; then
-                if backup_hf_original_model "$model_name" "$cache_dir"; then
-                    log_verbose_success "原始模型备份创建成功"
-
-                    # 步骤2: 删除已备份的原始模型缓存
-                    log_info "删除已备份的原始模型缓存..."
-                    if docker_rm_rf "$cache_dir"; then
-                        log_verbose_success "原始模型缓存已清理: $cache_dir"
-                    else
-                        log_warning "清理原始模型缓存失败，但不影响主要功能"
-                    fi
-                else
-                    log_warning "原始模型备份创建失败，保留缓存目录"
-                fi
-            else
-                log_info "未找到缓存目录，跳过备份和清理"
-            fi
-        else
-            log_warning "GGUF下载转换成功，但导入Ollama失败"
-            conversion_result=1
-        fi
-    else
-        echo "----------------------------------------"
-        log_error "HuggingFace模型下载转换失败: $model_name"
-        conversion_result=1
-    fi
-
-    # 手动清理并移除清理函数
-    cleanup_converter_container
-    remove_cleanup_function "cleanup_converter_container"
-
-    return $conversion_result
-}
 
 # 检查Ollama模型在backups目录中是否有备份
 check_ollama_backup_exists() {
@@ -3573,26 +2555,6 @@ check_ollama_backup_exists() {
     return 1
 }
 
-# 检查HuggingFace模型在hf_originals目录中是否有备份
-check_hf_original_backup_exists() {
-    local model_name="$1"
-
-    # 使用统一的文件系统安全命名
-    local model_safe_name=$(get_safe_model_name "$model_name" "filesystem")
-    local backup_dir="$ABS_HF_ORIGINAL_BACKUP_DIR/${model_safe_name}"
-    local backup_source_dir="$backup_dir/${model_safe_name}_original"
-
-    # 检查备份目录是否存在
-    if [[ -d "$backup_dir" ]]; then
-        # 检查是否有原始备份目录
-        if [[ -d "$backup_source_dir" ]]; then
-            echo "$backup_dir"
-            return 0
-        fi
-    fi
-
-    return 1
-}
 
 # 尝试从备份恢复Ollama模型
 try_restore_ollama_from_backup() {
@@ -3631,60 +2593,6 @@ try_restore_ollama_from_backup() {
     fi
 }
 
-# 尝试从HuggingFace原始备份恢复模型
-try_restore_hf_from_original() {
-    local model_name="$1"
-
-    log_verbose "检查HuggingFace原始模型备份: $model_name"
-
-    local backup_dir
-    if backup_dir=$(check_hf_original_backup_exists "$model_name"); then
-        log_verbose_success "找到HuggingFace原始模型备份: $backup_dir"
-
-        # 使用统一的文件系统安全命名
-        local model_safe_name=$(get_safe_model_name "$model_name" "filesystem")
-
-        # 查找原始备份目录（新的直接复制格式）
-        local backup_source_dir="$backup_dir/${model_safe_name}_original"
-        if [[ -d "$backup_source_dir" ]]; then
-            # 恢复到缓存目录
-            local cache_dir="$ABS_HF_DOWNLOAD_CACHE_DIR/$model_safe_name"
-            log_info "正在恢复HuggingFace原始模型到缓存目录..."
-
-            # MD5校验
-            local md5_file="${backup_source_dir}.md5"
-            if [[ -f "$md5_file" ]]; then
-                log_info "正在验证MD5校验值..."
-                if verify_directory_md5 "$backup_source_dir" "$md5_file"; then
-                    log_verbose_success "MD5校验通过"
-                else
-                    log_error "MD5校验失败，备份可能已损坏"
-                    return 1
-                fi
-            else
-                log_warning "未找到MD5校验文件，跳过校验"
-            fi
-
-            # 创建缓存目录
-            mkdir -p "$(dirname "$cache_dir")"
-
-            # 直接复制备份目录到缓存目录
-            if cp -r "$backup_source_dir" "$cache_dir"; then
-                log_success "从原始备份成功恢复模型到缓存: $model_name"
-                return 0
-            else
-                log_warning "从原始备份恢复失败"
-                return 1
-            fi
-        else
-            log_error "未找到有效的原始备份目录: $backup_source_dir"
-            return 1
-        fi
-    else
-        log_verbose "未找到HuggingFace原始模型备份"
-        return 1
-    fi
-}
 
 # 处理单个模型
 process_model() {
@@ -3753,7 +2661,6 @@ main() {
     CHECK_ONLY="true"
     FORCE_DOWNLOAD="false"
     REBUILD="false"
-    HF_TOKEN=""
     BACKUP_MODEL=""
     BACKUP_ALL="false"
     LIST_MODELS="false"
@@ -3783,10 +2690,6 @@ main() {
                 OLLAMA_DATA_DIR="$user_ollama_dir"
                 OLLAMA_MODELS_DIR="$user_ollama_dir/models"
             fi
-            shift 2
-            ;;
-        --hf-backup-dir)
-            HF_ORIGINAL_BACKUP_DIR="$2"
             shift 2
             ;;
         --backup)
@@ -3834,16 +2737,8 @@ main() {
             FORCE_RESTORE="true"
             shift
             ;;
-        --hf-token)
-            HF_TOKEN="$2"
-            shift 2
-            ;;
         --verbose)
             VERBOSE="true"
-            shift
-            ;;
-        --rebuild)
-            REBUILD="true"
             shift
             ;;
         --generate-compose)
@@ -3925,23 +2820,7 @@ main() {
         exit 0
     fi
 
-    # 检查是否需要Docker镜像（仅在有HuggingFace模型时）
-    local has_hf_models=false
-    for model in "${models[@]}"; do
-        if [[ "$model" =~ ^huggingface:|^hf-gguf: ]]; then
-            has_hf_models=true
-            break
-        fi
-    done
-
-    if [[ "$has_hf_models" == "true" ]]; then
-        if [[ "$REBUILD" == "true" ]]; then
-            build_docker_image
-        else
-            # 确保Docker镜像存在
-            ensure_hf_downloader_image
-        fi
-    fi
+    # HuggingFace GGUF models are downloaded directly through Ollama, no Docker images needed
 
     # 处理每个模型
     local total_models=${#models[@]}
@@ -4168,14 +3047,6 @@ generate_custom_models_list() {
                 custom_models_entries+=("$entry")
             fi
             ;;
-        "huggingface")
-            if [[ -n "$model_spec" && -n "$quantize_type" ]]; then
-                local ollama_name=$(echo "$model_spec" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
-                local alias=$(generate_model_alias "${ollama_name}:latest" "huggingface")
-                local entry="+${ollama_name}:latest@OpenAI=${alias}"
-                custom_models_entries+=("$entry")
-            fi
-            ;;
         esac
     done <"$models_file"
 
@@ -4208,11 +3079,6 @@ generate_model_alias() {
             # 移除常见的 GGUF 后缀
             model_name=$(echo "$model_name" | sed 's/-GGUF$//' | sed 's/_GGUF$//')
         fi
-        ;;
-    "huggingface")
-        # 对于 huggingface 模型，使用传递的已处理名称
-        model_name="$model_spec"
-        model_name="${model_name%:*}"
         ;;
     *)
         # 对于 ollama 和其他类型，使用基础名称
@@ -4264,13 +3130,6 @@ detect_default_model() {
             "hf-gguf")
                 first_active_model=$(generate_model_alias "$model_spec" "hf-gguf")
                 break
-                ;;
-            "huggingface")
-                if [[ -n "$quantize_type" ]]; then
-                    local ollama_name=$(echo "$model_spec" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/_/g')
-                    first_active_model=$(generate_model_alias "${ollama_name}:latest" "huggingface")
-                    break
-                fi
                 ;;
             esac
         fi
