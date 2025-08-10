@@ -134,36 +134,6 @@ execute_task() {
 	fi
 }
 
-# 备份单个模型的包装函数
-backup_single_model() {
-	local backup_model="$1"
-	local backup_dir="$2"
-
-	# 处理不同类型的模型前缀
-	local model_to_backup="${backup_model}"
-	if [[ ${backup_model} =~ ^hf-gguf:(.+)$ ]]; then
-		model_to_backup="${BASH_REMATCH[1]}"
-	elif [[ ${backup_model} =~ ^ollama:(.+)$ ]]; then
-		model_to_backup="${BASH_REMATCH[1]}"
-	fi
-
-	backup_ollama_model "${model_to_backup}" "${backup_dir}"
-}
-
-# 恢复模型的包装函数
-restore_model() {
-	local restore_file="$1"
-	local force_restore="$2"
-
-	# 如果恢复文件不是绝对路径，则在BACKUP_OUTPUT_DIR中查找
-	local restore_path="${restore_file}"
-	if [[ ${restore_file} != /* ]]; then
-		restore_path="${BACKUP_OUTPUT_DIR}/${restore_file}"
-	fi
-
-	restore_ollama_model "${restore_path}" "${force_restore}"
-}
-
 # 模型处理器 - 解析模型条目并返回处理函数
 parse_model_entry() {
 	local model_entry="$1"
@@ -213,6 +183,10 @@ check_model_exists() {
 	esac
 }
 
+#==============================================================================
+# 模型下载模块
+#==============================================================================
+
 # 下载模型
 download_model() {
 	local -n model_info_ref=$1
@@ -228,6 +202,168 @@ download_model() {
 	esac
 }
 
+# 下载Ollama模型
+download_ollama_model() {
+	local model_name="$1"
+	local model_tag="$2"
+
+	local full_model_name="${model_name}:${model_tag}"
+
+	log_info "Downloading: ${full_model_name}"
+
+	if execute_ollama_command "pull" "${full_model_name}"; then
+		log_verbose_success "Downloaded: ${full_model_name}"
+
+		# 验证下载后的模型完整性
+		if verify_model_after_installation "${model_name}" "${model_tag}"; then
+			log_verbose_success "Verified: ${full_model_name}"
+			return 0
+		else
+			log_error "Verification failed: ${full_model_name}"
+			return 1
+		fi
+	else
+		log_error "Download failed: ${full_model_name}"
+		return 1
+	fi
+}
+
+#==============================================================================
+# 模型备份模块 (Model Backup Module)
+#==============================================================================
+
+# 备份单个模型的包装函数
+backup_single_model() {
+	local backup_model="$1"
+	local backup_dir="$2"
+
+	# 处理不同类型的模型前缀
+	local model_to_backup="${backup_model}"
+	if [[ ${backup_model} =~ ^hf-gguf:(.+)$ ]]; then
+		model_to_backup="${BASH_REMATCH[1]}"
+	elif [[ ${backup_model} =~ ^ollama:(.+)$ ]]; then
+		model_to_backup="${BASH_REMATCH[1]}"
+	fi
+
+	backup_ollama_model "${model_to_backup}" "${backup_dir}"
+}
+
+backup_ollama_model() {
+	local model_spec="$1"
+	local backup_dir="$2"
+
+	# 初始化缓存以提高完整性检查性能
+	ensure_cache_initialized
+
+	# 解析模型名称和版本
+	local model_name model_version
+	if ! parse_model_spec "${model_spec}" model_name model_version; then
+		return 1
+	fi
+
+	log_verbose "备份模型: ${model_name}:${model_version}"
+	local model_spec="${model_name}:${model_version}"
+	if ! verify_integrity "model" "${model_spec}" "use_cache:true,check_blobs:true"; then
+		log_error "本地模型不完整，取消备份操作"
+		return 1
+	fi
+
+	# 创建备份目录和生成路径
+	local model_backup_dir
+	model_backup_dir=$(create_model_backup_dir "${model_spec}" "${backup_dir}") || return 1
+	local model_safe_name
+	model_safe_name=$(get_safe_model_name "${model_spec}")
+	local backup_model_dir="${model_backup_dir}/${model_safe_name}"
+
+	# 检查是否已存在备份目录
+	if [[ -d ${backup_model_dir} ]]; then
+		log_success "模型备份已存在"
+		return 0
+	fi
+
+	# 确定manifest文件路径
+	local manifest_file
+	manifest_file=$(get_model_manifest_path "${model_name}" "${model_version}")
+
+	# 检查manifest文件是否存在
+	if [[ ! -f ${manifest_file} ]]; then
+		log_error "模型不存在: ${model_spec}"
+		return 1
+	fi
+
+	# 获取blob文件路径
+	local blob_files
+	blob_files=$(get_model_blob_paths "${manifest_file}" "${OLLAMA_MODELS_DIR}")
+
+	if [[ -z ${blob_files} ]]; then
+		log_error "未找到模型相关的blob文件"
+		return 1
+	fi
+
+	# 创建备份目录结构
+	mkdir -p "${backup_model_dir}/manifests"
+	mkdir -p "${backup_model_dir}/blobs"
+
+	log_verbose "开始复制文件..."
+
+	# 复制manifest文件
+	local manifest_rel_path="${manifest_file#"${OLLAMA_MODELS_DIR}"/manifests/}"
+	local manifest_backup_dir
+	manifest_backup_dir="${backup_model_dir}/manifests/$(dirname "${manifest_rel_path}")"
+	mkdir -p "${manifest_backup_dir}"
+	if ! cp "${manifest_file}" "${manifest_backup_dir}/"; then
+		log_error "复制manifest文件失败: ${manifest_file}"
+		rm -rf "${backup_model_dir}"
+		return 1
+	fi
+
+	# 复制blob文件
+	while IFS= read -r blob_file; do
+		if [[ -f ${blob_file} ]]; then
+			local blob_name
+			blob_name=$(basename "${blob_file}")
+			if ! cp "${blob_file}" "${backup_model_dir}/blobs/"; then
+				log_error "复制blob文件失败: ${blob_file}"
+				rm -rf "${backup_model_dir}"
+				return 1
+			fi
+		fi
+	done <<<"${blob_files}"
+
+	# 计算MD5校验
+	log_verbose "计算MD5校验值..."
+	local md5_file="${backup_model_dir}.md5"
+	if calculate_directory_md5 "${backup_model_dir}" "${md5_file}"; then
+		log_verbose "MD5校验文件已创建: ${md5_file}"
+	else
+		log_warning "MD5校验文件创建失败"
+	fi
+
+	# 创建备份信息文件
+	create_backup_info "${model_spec}" "${backup_model_dir}" "directory" 1 "ollama"
+
+	log_verbose_success "模型备份完成: ${model_spec}"
+	return 0
+}
+
+#==============================================================================
+# 模型恢复模块 (Model Restore Module)
+#==============================================================================
+
+# 恢复模型的包装函数
+restore_model() {
+	local restore_file="$1"
+	local force_restore="$2"
+
+	# 如果恢复文件不是绝对路径，则在BACKUP_OUTPUT_DIR中查找
+	local restore_path="${restore_file}"
+	if [[ ${restore_file} != /* ]]; then
+		restore_path="${BACKUP_OUTPUT_DIR}/${restore_file}"
+	fi
+
+	restore_ollama_model "${restore_path}" "${force_restore}"
+}
+
 # 尝试从备份恢复模型
 try_restore_model() {
 	local -n model_info_ref=$1
@@ -239,6 +375,151 @@ try_restore_model() {
 		;;
 	*)
 		log_error "Unsupported model type: ${model_info_ref[type]}"
+		return 1
+		;;
+	esac
+}
+
+#==============================================================================
+# 模型验证模块 (Model Validation Module)
+#==============================================================================
+
+# 验证模型格式是否正确
+validate_model_format() {
+	local model_spec="$1"
+	if [[ ${model_spec} != *":"* ]]; then
+		log_error "Invalid model format, should be 'model_name:version', e.g. 'llama2:7b'"
+		return 1
+	fi
+	return 0
+}
+
+# 验证模型业务逻辑完整性
+validate_model_business_integrity() {
+	local backup_dir="$1"
+
+	# 检查备份目录是否存在
+	if [[ ! -d ${backup_dir} ]]; then
+		log_error "Backup directory does not exist: ${backup_dir}"
+		return 1
+	fi
+
+	# 查找manifest文件
+	local manifest_files=()
+	while IFS= read -r -d '' manifest; do
+		manifest_files+=("${manifest}")
+	done < <(find "${backup_dir}" -path "*/manifests/*" -type f -print0 2>/dev/null || true)
+
+	if [[ ${#manifest_files[@]} -eq 0 ]]; then
+		log_error "Manifest file not found in backup"
+		return 1
+	fi
+
+	# 检查每个manifest引用的blob文件
+	local missing_blobs=0
+	local total_blobs=0
+
+	for manifest_file in "${manifest_files[@]}"; do
+		[[ ! -f ${manifest_file} ]] && continue
+
+		# 解析manifest文件中的blob引用
+		local blob_digests
+		blob_digests=$(grep -o '"digest":"sha256:[a-f0-9]\{64\}"' "${manifest_file}" 2>/dev/null | sed 's/"digest":"sha256:\([a-f0-9]\{64\}\)"/\1/g')
+
+		for digest in ${blob_digests}; do
+			((total_blobs++))
+			local blob_path="${backup_dir}/blobs/sha256-${digest}"
+			if [[ ! -f ${blob_path} ]]; then
+				log_error "Missing blob file: sha256-${digest}"
+				((missing_blobs++))
+			fi
+		done
+	done
+
+	if [[ ${missing_blobs} -gt 0 ]]; then
+		log_error "Found ${missing_blobs}/${total_blobs} missing blob files"
+		return 1
+	fi
+
+	log_verbose_success "Model business logic integrity verification passed (${total_blobs} blob files)"
+	return 0
+}
+
+# 验证模型安装后的完整性
+verify_model_after_installation() {
+	local model_name="$1"
+	local model_tag="$2"
+	local full_model_name="${model_name}:${model_tag}"
+
+	log_verbose "Verifying model installation integrity: ${full_model_name}"
+
+	# 初始化缓存以提高完整性检查性能
+	ensure_cache_initialized
+
+	# 等待一下让文件系统同步
+	sleep 2
+
+	# 检查模型完整性（使用缓存优化）
+	local model_spec="${model_name}:${model_tag}"
+	if verify_integrity "model" "${model_spec}" "use_cache:true,check_blobs:true"; then
+		log_verbose_success "Model installation integrity verification passed: ${full_model_name}"
+		return 0
+	else
+		log_error "Model installation incomplete, cleaning up: ${full_model_name}"
+		cleanup_incomplete_model "${model_name}" "${model_tag}"
+		return 1
+	fi
+}
+
+# 通用完整性验证函数 - 统一所有验证逻辑的入口点
+verify_integrity() {
+	local verification_type="$1" # model, backup, hf_model
+	local target="$2"            # 目标文件/路径/模型规格
+	local options="${3-}"        # 附加选项 (use_cache:true, check_blobs:true, etc.)
+
+	# 解析选项
+	local use_cache="true"
+	local check_blobs="true"
+	local model_spec=""
+
+	# 解析选项字符串
+	if [[ -n ${options} ]]; then
+		while IFS=',' read -ra ADDR; do
+			for i in "${ADDR[@]}"; do
+				case "${i}" in
+				use_cache:*)
+					use_cache="${i#*:}"
+					;;
+				check_blobs:*)
+					check_blobs="${i#*:}"
+					;;
+				model_spec:*)
+					model_spec="${i#*:}"
+					;;
+				*)
+					# 忽略未知选项
+					;;
+				esac
+			done
+		done <<<"${options}"
+	fi
+
+	# 确保缓存已初始化
+	[[ ${use_cache} == "true" ]] && ensure_cache_initialized
+
+	# 根据验证类型调用相应的验证逻辑
+	case "${verification_type}" in
+	"model")
+		_verify_local_model "${target}" "${use_cache}" "${check_blobs}"
+		;;
+	"backup")
+		_verify_backup_target "${target}" "${model_spec}" "${use_cache}" "${check_blobs}"
+		;;
+	"backup_file")
+		_verify_backup_file "${target}" "${use_cache}"
+		;;
+	*)
+		log_error "Unknown verification type: ${verification_type}"
 		return 1
 		;;
 	esac
@@ -300,16 +581,6 @@ format_bytes() {
         else if (b >= 1048576) printf "%.1fMB", b / 1048576  
         else printf "%.1fKB", b / 1024
     }'
-}
-
-# 验证模型格式是否正确
-validate_model_format() {
-	local model_spec="$1"
-	if [[ ${model_spec} != *":"* ]]; then
-		log_error "Invalid model format, should be 'model_name:version', e.g. 'llama2:7b'"
-		return 1
-	fi
-	return 0
 }
 
 # 等待Ollama容器就绪
@@ -469,75 +740,6 @@ check_ollama_model_exists() {
 	fi
 }
 
-# 验证模型业务逻辑完整性
-validate_model_business_integrity() {
-	local backup_file="$1"
-
-	# 创建临时目录提取备份文件
-	local temp_dir
-	temp_dir=$(mktemp -d) || {
-		log_error "Failed to create temporary directory"
-		return 1
-	}
-
-	# 清理函数
-	cleanup_temp_business() {
-		[[ -d ${temp_dir-} ]] && docker_rm_rf "${temp_dir}"
-	}
-	add_cleanup_function "cleanup_temp_business"
-
-	# 提取备份文件到临时目录
-	if ! tar -xf "${backup_file}" -C "${temp_dir}" 2>/dev/null; then
-		log_error "Unable to extract backup file for business logic verification"
-		cleanup_temp_business
-		return 1
-	fi
-
-	# 查找manifest文件
-	local manifest_files=()
-	while IFS= read -r -d '' manifest; do
-		manifest_files+=("${manifest}")
-	done < <(find "${temp_dir}" -path "*/manifests/*" -type f -print0 2>/dev/null || true)
-
-	if [[ ${#manifest_files[@]} -eq 0 ]]; then
-		log_error "Manifest file not found in backup"
-		cleanup_temp_business
-		return 1
-	fi
-
-	# 检查每个manifest引用的blob文件
-	local missing_blobs=0
-	local total_blobs=0
-
-	for manifest_file in "${manifest_files[@]}"; do
-		if [[ -f ${manifest_file} ]]; then
-			# 解析manifest文件中的blob引用
-			local blob_digests
-			blob_digests=$(grep -o '"digest":"sha256:[a-f0-9]\{64\}"' "${manifest_file}" 2>/dev/null | sed 's/"digest":"sha256:\([a-f0-9]\{64\}\)"/\1/g')
-
-			for digest in ${blob_digests}; do
-				((total_blobs++))
-				local blob_path="${temp_dir}/blobs/sha256-${digest}"
-				if [[ ! -f ${blob_path} ]]; then
-					log_error "Missing blob file: sha256-${digest}"
-					((missing_blobs++))
-				fi
-			done
-		fi
-	done
-
-	cleanup_temp_business
-	remove_cleanup_function "cleanup_temp_business"
-
-	if [[ ${missing_blobs} -gt 0 ]]; then
-		log_error "Found ${missing_blobs}/${total_blobs} missing blob files"
-		return 1
-	fi
-
-	log_verbose_success "Model business logic integrity verification passed (${total_blobs} blob files)"
-	return 0
-}
-
 # 清理不完整的模型
 cleanup_incomplete_model() {
 	local model_name="$1"
@@ -548,18 +750,7 @@ cleanup_incomplete_model() {
 
 	# 确定manifest文件路径
 	local manifest_file
-	if [[ ${model_name} == hf.co/* ]]; then
-		# HuggingFace GGUF模型
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/${model_name}/${model_tag}"
-	elif [[ ${model_name} == *"/"* ]]; then
-		# 用户分享的模型
-		local user_name="${model_name%/*}"
-		local repo_name="${model_name#*/}"
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/${user_name}/${repo_name}/${model_tag}"
-	else
-		# 官方模型
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_tag}"
-	fi
+	manifest_file=$(get_model_manifest_path "${model_name}" "${model_tag}")
 
 	# 删除manifest文件
 	if [[ -f ${manifest_file} ]]; then
@@ -577,29 +768,22 @@ cleanup_incomplete_model() {
 	log_verbose_success "Incomplete model cleanup completed: ${full_model_name}"
 }
 
-# 验证模型安装后的完整性
-verify_model_after_installation() {
+# 获取模型manifest文件路径的统一函数
+get_model_manifest_path() {
 	local model_name="$1"
-	local model_tag="$2"
-	local full_model_name="${model_name}:${model_tag}"
+	local model_version="$2"
 
-	log_verbose "Verifying model installation integrity: ${full_model_name}"
-
-	# 初始化缓存以提高完整性检查性能
-	ensure_cache_initialized
-
-	# 等待一下让文件系统同步
-	sleep 2
-
-	# 检查模型完整性（使用缓存优化）
-	local model_spec="${model_name}:${model_tag}"
-	if verify_integrity "model" "${model_spec}" "use_cache:true,check_blobs:true"; then
-		log_verbose_success "Model installation integrity verification passed: ${full_model_name}"
-		return 0
+	if [[ ${model_name} == hf.co/* ]]; then
+		# HuggingFace GGUF模型，如 hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF
+		echo "${OLLAMA_MODELS_DIR}/manifests/${model_name}/${model_version}"
+	elif [[ ${model_name} == *"/"* ]]; then
+		# 用户分享的模型，如 lrs33/bce-embedding-base_v1
+		local user_name="${model_name%/*}"
+		local repo_name="${model_name#*/}"
+		echo "${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/${user_name}/${repo_name}/${model_version}"
 	else
-		log_error "Model installation incomplete, cleaning up: ${full_model_name}"
-		cleanup_incomplete_model "${model_name}" "${model_tag}"
-		return 1
+		# 官方模型
+		echo "${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_version}"
 	fi
 }
 
@@ -1043,32 +1227,6 @@ check_hf_gguf_model() {
 	return 1
 }
 
-# 下载Ollama模型
-download_ollama_model() {
-	local model_name="$1"
-	local model_tag="$2"
-
-	local full_model_name="${model_name}:${model_tag}"
-
-	log_info "Downloading: ${full_model_name}"
-
-	if execute_ollama_command "pull" "${full_model_name}"; then
-		log_verbose_success "Downloaded: ${full_model_name}"
-
-		# 验证下载后的模型完整性
-		if verify_model_after_installation "${model_name}" "${model_tag}"; then
-			log_verbose_success "Verified: ${full_model_name}"
-			return 0
-		else
-			log_error "Verification failed: ${full_model_name}"
-			return 1
-		fi
-	else
-		log_error "Download failed: ${full_model_name}"
-		return 1
-	fi
-}
-
 # 删除Ollama模型
 remove_ollama_model() {
 	local model_spec="$1"
@@ -1295,15 +1453,7 @@ get_model_blobs_cached() {
 
 	# 确定manifest文件路径
 	local manifest_file
-	if [[ ${model_name} == hf.co/* ]]; then
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/${model_name}/${model_version}"
-	elif [[ ${model_name} == *"/"* ]]; then
-		local user_name="${model_name%/*}"
-		local repo_name="${model_name#*/}"
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/${user_name}/${repo_name}/${model_version}"
-	else
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_version}"
-	fi
+	manifest_file=$(get_model_manifest_path "${model_name}" "${model_version}")
 
 	# 获取blob文件列表
 	if [[ -f ${manifest_file} ]]; then
@@ -1417,15 +1567,7 @@ _verify_local_model() {
 
 	# 确定manifest文件路径
 	local manifest_file
-	if [[ ${model_name} == hf.co/* ]]; then
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/${model_name}/${model_tag}"
-	elif [[ ${model_name} == *"/"* ]]; then
-		local user_name="${model_name%/*}"
-		local repo_name="${model_name#*/}"
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/${user_name}/${repo_name}/${model_tag}"
-	else
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_tag}"
-	fi
+	manifest_file=$(get_model_manifest_path "${model_name}" "${model_tag}")
 
 	# 检查manifest文件是否存在
 	[[ ! -f ${manifest_file} ]] && return 1
@@ -1494,20 +1636,23 @@ _verify_backup_target() {
 
 # 内部函数：验证备份文件（业务逻辑完整性）
 _verify_backup_file() {
-	local backup_file="$1"
+	local backup_dir="$1"
 	local use_detailed_check="$2"
 
-	[[ ! -f ${backup_file} ]] && return 1
+	[[ ! -d ${backup_dir} ]] && return 1
 
-	# 基本tar文件完整性检查
-	if ! docker run --rm --entrypoint="" -v "$(dirname "${backup_file}"):/data" hf_downloader:latest sh -c "
-        cd /data && tar -tf '$(basename "${backup_file}")' >/dev/null 2>&1
-    "; then
+	# 基本目录结构检查
+	if [[ ! -d ${backup_dir}/manifests ]] || [[ ! -d ${backup_dir}/blobs ]]; then
+		return 1
+	fi
+
+	# 检查是否有manifest文件
+	if ! find "${backup_dir}/manifests" -type f -name "*" | head -1 | read -r; then
 		return 1
 	fi
 
 	# 如果需要详细检查，执行业务逻辑验证
-	[[ ${use_detailed_check} == "true" ]] && validate_model_business_integrity "${backup_file}"
+	[[ ${use_detailed_check} == "true" ]] && validate_model_business_integrity "${backup_dir}"
 }
 
 # 删除不完整的备份文件
@@ -1914,115 +2059,6 @@ list_installed_models() {
 }
 
 # 备份Ollama模型（直接复制）
-backup_ollama_model() {
-	local model_spec="$1"
-	local backup_dir="$2"
-
-	# 初始化缓存以提高完整性检查性能
-	ensure_cache_initialized
-
-	# 解析模型名称和版本
-	local model_name model_version
-	if ! parse_model_spec "${model_spec}" model_name model_version; then
-		return 1
-	fi
-
-	log_verbose "备份模型: ${model_name}:${model_version}"
-	local model_spec="${model_name}:${model_version}"
-	if ! verify_integrity "model" "${model_spec}" "use_cache:true,check_blobs:true"; then
-		log_error "本地模型不完整，取消备份操作"
-		return 1
-	fi
-
-	# 创建备份目录和生成路径
-	local model_backup_dir
-	model_backup_dir=$(create_model_backup_dir "${model_spec}" "${backup_dir}") || return 1
-	local model_safe_name
-	model_safe_name=$(get_safe_model_name "${model_spec}")
-	local backup_model_dir="${model_backup_dir}/${model_safe_name}"
-
-	# 检查是否已存在备份目录
-	if [[ -d ${backup_model_dir} ]]; then
-		log_success "模型备份已存在"
-		return 0
-	fi
-
-	# 确定manifest文件路径
-	local manifest_file
-	if [[ ${model_name} == hf.co/* ]]; then
-		# HuggingFace GGUF模型，如 hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/${model_name}/${model_version}"
-	elif [[ ${model_name} == *"/"* ]]; then
-		# 用户分享的模型，如 lrs33/bce-embedding-base_v1
-		local user_name="${model_name%/*}"
-		local repo_name="${model_name#*/}"
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/${user_name}/${repo_name}/${model_version}"
-	else
-		# 官方模型
-		manifest_file="${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_version}"
-	fi
-
-	# 检查manifest文件是否存在
-	if [[ ! -f ${manifest_file} ]]; then
-		log_error "模型不存在: ${model_spec}"
-		return 1
-	fi
-
-	# 获取blob文件路径
-	local blob_files
-	blob_files=$(get_model_blob_paths "${manifest_file}" "${OLLAMA_MODELS_DIR}")
-
-	if [[ -z ${blob_files} ]]; then
-		log_error "未找到模型相关的blob文件"
-		return 1
-	fi
-
-	# 创建备份目录结构
-	mkdir -p "${backup_model_dir}/manifests"
-	mkdir -p "${backup_model_dir}/blobs"
-
-	log_verbose "开始复制文件..."
-
-	# 复制manifest文件
-	local manifest_rel_path="${manifest_file#"${OLLAMA_MODELS_DIR}"/manifests/}"
-	local manifest_backup_dir
-	manifest_backup_dir="${backup_model_dir}/manifests/$(dirname "${manifest_rel_path}")"
-	mkdir -p "${manifest_backup_dir}"
-	if ! cp "${manifest_file}" "${manifest_backup_dir}/"; then
-		log_error "复制manifest文件失败: ${manifest_file}"
-		rm -rf "${backup_model_dir}"
-		return 1
-	fi
-
-	# 复制blob文件
-	while IFS= read -r blob_file; do
-		if [[ -f ${blob_file} ]]; then
-			local blob_name
-			blob_name=$(basename "${blob_file}")
-			if ! cp "${blob_file}" "${backup_model_dir}/blobs/"; then
-				log_error "复制blob文件失败: ${blob_file}"
-				rm -rf "${backup_model_dir}"
-				return 1
-			fi
-		fi
-	done <<<"${blob_files}"
-
-	# 计算MD5校验
-	log_verbose "计算MD5校验值..."
-	local md5_file="${backup_model_dir}.md5"
-	if calculate_directory_md5 "${backup_model_dir}" "${md5_file}"; then
-		log_verbose "MD5校验文件已创建: ${md5_file}"
-	else
-		log_warning "MD5校验文件创建失败"
-	fi
-
-	# 创建备份信息文件
-	create_backup_info "${model_spec}" "${backup_model_dir}" "directory" 1 "ollama"
-
-	log_verbose_success "模型备份完成: ${model_spec}"
-	return 0
-}
-
 # 智能删除模型（自动识别模型类型）
 remove_model_smart() {
 	local model_input="$1"
@@ -2098,30 +2134,20 @@ restore_ollama_model() {
 		log_info "检查模型冲突..."
 		local conflicts_found=false
 
-		# 检查manifests冲突
-		if find "${backup_dir}/manifests" -type f 2>/dev/null | while read -r manifest_file; do
-			local rel_path="${manifest_file#"${backup_dir}"/manifests/}"
-			local target_file="${OLLAMA_MODELS_DIR}/manifests/${rel_path}"
-			if [[ -f ${target_file} ]]; then
-				echo "conflict"
+		# 检查manifests和blobs冲突
+		for backup_subdir in manifests blobs; do
+			if find "${backup_dir}/${backup_subdir}" -type f 2>/dev/null | while read -r backup_file; do
+				local rel_path="${backup_file#"${backup_dir}/${backup_subdir}"/}"
+				local target_file="${OLLAMA_MODELS_DIR}/${backup_subdir}/${rel_path}"
+				if [[ -f ${target_file} ]]; then
+					echo "conflict"
+					break
+				fi
+			done | grep -q "conflict"; then
+				conflicts_found=true
 				break
 			fi
-		done | grep -q "conflict"; then
-			conflicts_found=true
-		fi
-
-		# 检查blobs冲突
-		if find "${backup_dir}/blobs" -type f 2>/dev/null | while read -r blob_file; do
-			local blob_name
-			blob_name=$(basename "${blob_file}")
-			local target_file="${OLLAMA_MODELS_DIR}/blobs/${blob_name}"
-			if [[ -f ${target_file} ]]; then
-				echo "conflict"
-				break
-			fi
-		done | grep -q "conflict"; then
-			conflicts_found=true
-		fi
+		done
 
 		if [[ ${conflicts_found} == "true" ]]; then
 			log_error "检测到文件冲突，使用 --force 强制覆盖"
