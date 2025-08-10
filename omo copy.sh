@@ -65,6 +65,9 @@ ABS_OLLAMA_DATA_DIR=""
 
 # Docker镜像配置
 readonly DOCKER_IMAGE_OLLAMA="ollama/ollama:latest"
+readonly DOCKER_IMAGE_ONE_API="justsong/one-api:latest"
+readonly DOCKER_IMAGE_PROMPT_OPTIMIZER="linshen/prompt-optimizer:latest"
+readonly DOCKER_IMAGE_CHATGPT_NEXT_WEB="yidadaa/chatgpt-next-web:latest"
 
 # 运行时配置
 VERBOSE="false" # 详细模式开关
@@ -73,57 +76,6 @@ VERBOSE="false" # 详细模式开关
 # 工具函数
 #==============================================================================
 
-# 颜色定义
-readonly RED='\033[0;31m'
-readonly GREEN='\033[0;32m'
-readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
-readonly NC='\033[0m' # No Color
-#==============================================================================
-# 日志系统模块
-#==============================================================================
-# 日志规则:
-# 1. 主流程函数: 使用标准日志函数(log_info, log_success, log_warning, log_error)
-#    - 在普通模式和verbose模式下都显示, 用于用户关心的核心操作进度
-# 2. 工具函数: 正常追踪日志使用verbose版本(log_verbose, log_verbose_success)
-#    - 仅在verbose模式显示, 警告和错误(log_warning, log_error)在任何模式都显示
-# 3. 避免日志重复: 工具函数的追踪信息只在verbose模式显示, 主流程保持简洁
-#==============================================================================
-
-log_info() {
-	printf "${BLUE}[INFO]${NC} %s\n" "$1"
-}
-
-log_success() {
-	printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
-}
-
-log_warning() {
-	printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
-}
-
-log_error() {
-	printf "${RED}[ERROR]${NC} %s\n" "$1"
-}
-
-# Verbose-only logging functions
-log_verbose() {
-	if [[ ${VERBOSE} == "true" ]]; then
-		printf "${BLUE}[INFO]${NC} %s\n" "$1"
-	fi
-	return 0
-}
-
-log_verbose_success() {
-	[[ ${VERBOSE} == "true" ]] && printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
-	return 0
-}
-
-log_verbose_warning() {
-	[[ ${VERBOSE} == "true" ]] && printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
-	return 0
-}
-
 # 显示容器日志的工具函数
 show_container_logs() {
 	local container_name="$1"
@@ -131,8 +83,152 @@ show_container_logs() {
 	docker logs "${container_name}" 2>&1 | tail -10
 }
 
+# 获取主机时区
+get_host_timezone() {
+	# 尝试多种方法获取主机时区
+	if command_exists timedatectl; then
+		# 优先使用 timedatectl（systemd 系统）
+		timedatectl show --property=Timezone --value 2>/dev/null
+	elif [[ -L /etc/localtime ]]; then
+		# 通过符号链接获取时区
+		readlink /etc/localtime | sed 's|.*/zoneinfo/||'
+	elif [[ -f /etc/timezone ]]; then
+		# 从 /etc/timezone 文件读取
+		cat /etc/timezone
+	else
+		# 默认回退到 UTC
+		echo "UTC"
+	fi
+}
+
+# 颜色定义
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly NC='\033[0m' # No Color
+
 #==============================================================================
-# 文件、路径相关工具函数
+# 任务执行模块
+#==============================================================================
+# 统一的任务执行函数
+execute_task() {
+	local task_name="$1"
+	local task_function="$2"
+	shift 2
+	local task_args=("$@")
+
+	log_info "Executing ${task_name}..."
+	if "${task_function}" "${task_args[@]}"; then
+		log_success "${task_name} completed"
+		exit 0
+	else
+		local exit_code=$?
+		if [[ ${exit_code} -eq 2 ]]; then
+			# 用户取消操作，不显示错误信息
+			exit 0
+		else
+			log_error "${task_name} failed"
+			exit 1
+		fi
+	fi
+}
+
+# 模型处理器 - 解析模型条目并返回处理函数
+parse_model_entry() {
+	local model_entry="$1"
+	local -n result_ref="$2"
+
+	# 清空结果数组
+	result_ref=()
+
+	if [[ ${model_entry} =~ ^ollama:([^:]+):(.+)$ ]]; then
+		result_ref[type]="ollama"
+		result_ref[name]="${BASH_REMATCH[1]}"
+		result_ref[tag]="${BASH_REMATCH[2]}"
+		result_ref[display]="${result_ref[name]}:${result_ref[tag]} (Ollama)"
+
+	elif [[ ${model_entry} =~ ^hf-gguf:(.+)$ ]]; then
+		result_ref[type]="hf-gguf"
+		local model_full_name="${BASH_REMATCH[1]}"
+		if [[ ${model_full_name} =~ ^(.+):(.+)$ ]]; then
+			result_ref[name]="${BASH_REMATCH[1]}"
+			result_ref[tag]="${BASH_REMATCH[2]}"
+		else
+			result_ref[name]="${model_full_name}"
+			result_ref[tag]="latest"
+		fi
+		result_ref[display]="${result_ref[name]}:${result_ref[tag]} (HF-GGUF)"
+	else
+		return 1
+	fi
+
+	return 0
+}
+
+# 检查模型是否存在
+check_model_exists() {
+	local -n model_info_ref=$1
+
+	case "${model_info_ref[type]}" in
+	"ollama")
+		check_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
+		;;
+	"hf-gguf")
+		check_hf_gguf_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+#==============================================================================
+# 模型下载模块
+#==============================================================================
+
+# 下载模型
+download_model() {
+	local -n model_info_ref=$1
+
+	case "${model_info_ref[type]}" in
+	"ollama" | "hf-gguf")
+		download_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
+		;;
+	*)
+		log_error "Unsupported model type: ${model_info_ref[type]}"
+		return 1
+		;;
+	esac
+}
+
+# 下载Ollama模型
+download_ollama_model() {
+	local model_name="$1"
+	local model_tag="$2"
+
+	local full_model_name="${model_name}:${model_tag}"
+
+	log_info "Downloading: ${full_model_name}"
+
+	if execute_ollama_command "pull" "${full_model_name}"; then
+		log_verbose_success "Downloaded: ${full_model_name}"
+
+		# 验证下载后的模型完整性
+		if verify_model_after_installation "${model_name}" "${model_tag}"; then
+			log_verbose_success "Verified: ${full_model_name}"
+			return 0
+		else
+			log_error "Verification failed: ${full_model_name}"
+			return 1
+		fi
+	else
+		log_error "Download failed: ${full_model_name}"
+		return 1
+	fi
+}
+#==============================================================================
+# 其他工具函数
 #==============================================================================
 # 获取模型备份路径
 get_model_backup_path() {
@@ -217,131 +313,6 @@ get_model_manifest_path() {
 	else
 		# 官方模型
 		echo "${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_version}"
-	fi
-}
-
-#==============================================================================
-# 其他工具函数
-#==============================================================================
-
-# 获取主机时区
-get_host_timezone() {
-	# 尝试多种方法获取主机时区
-	if command_exists timedatectl; then
-		# 优先使用 timedatectl（systemd 系统）
-		timedatectl show --property=Timezone --value 2>/dev/null
-	elif [[ -L /etc/localtime ]]; then
-		# 通过符号链接获取时区
-		readlink /etc/localtime | sed 's|.*/zoneinfo/||'
-	elif [[ -f /etc/timezone ]]; then
-		# 从 /etc/timezone 文件读取
-		cat /etc/timezone
-	else
-		# 默认回退到 UTC
-		echo "UTC"
-	fi
-}
-
-#==============================================================================
-# 任务执行模块
-#==============================================================================
-# 统一的任务执行函数
-execute_task() {
-	local task_name="$1"
-	local task_function="$2"
-	shift 2
-	local task_args=("$@")
-
-	log_info "Executing ${task_name}..."
-	if "${task_function}" "${task_args[@]}"; then
-		log_success "${task_name} completed"
-		exit 0
-	else
-		local exit_code=$?
-		if [[ ${exit_code} -eq 2 ]]; then
-			# 用户取消操作，不显示错误信息
-			exit 0
-		else
-			log_error "${task_name} failed"
-			exit 1
-		fi
-	fi
-}
-
-# 模型处理器 - 解析模型条目并返回处理函数
-parse_model_entry() {
-	local model_entry="$1"
-	local -n result_ref="$2"
-
-	# 清空结果数组
-	result_ref=()
-
-	if [[ ${model_entry} =~ ^ollama:([^:]+):(.+)$ ]]; then
-		result_ref[type]="ollama"
-		result_ref[name]="${BASH_REMATCH[1]}"
-		result_ref[tag]="${BASH_REMATCH[2]}"
-		result_ref[display]="${result_ref[name]}:${result_ref[tag]} (Ollama)"
-
-	elif [[ ${model_entry} =~ ^hf-gguf:(.+)$ ]]; then
-		result_ref[type]="hf-gguf"
-		local model_full_name="${BASH_REMATCH[1]}"
-		if [[ ${model_full_name} =~ ^(.+):(.+)$ ]]; then
-			result_ref[name]="${BASH_REMATCH[1]}"
-			result_ref[tag]="${BASH_REMATCH[2]}"
-		else
-			result_ref[name]="${model_full_name}"
-			result_ref[tag]="latest"
-		fi
-		result_ref[display]="${result_ref[name]}:${result_ref[tag]} (HF-GGUF)"
-	else
-		return 1
-	fi
-
-	return 0
-}
-
-#==============================================================================
-# 模型下载模块
-#==============================================================================
-
-# 下载模型
-download_model() {
-	local -n model_info_ref=$1
-
-	case "${model_info_ref[type]}" in
-	"ollama" | "hf-gguf")
-		download_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
-	*)
-		log_error "Unsupported model type: ${model_info_ref[type]}"
-		return 1
-		;;
-	esac
-}
-
-# 下载Ollama模型
-download_ollama_model() {
-	local model_name="$1"
-	local model_tag="$2"
-
-	local full_model_name="${model_name}:${model_tag}"
-
-	log_info "Downloading: ${full_model_name}"
-
-	if execute_ollama_command "pull" "${full_model_name}"; then
-		log_verbose_success "Downloaded: ${full_model_name}"
-
-		# 验证下载后的模型完整性
-		if verify_model_after_installation "${model_name}" "${model_tag}"; then
-			log_verbose_success "Verified: ${full_model_name}"
-			return 0
-		else
-			log_error "Verification failed: ${full_model_name}"
-			return 1
-		fi
-	else
-		log_error "Download failed: ${full_model_name}"
-		return 1
 	fi
 }
 
@@ -480,24 +451,9 @@ verify_directory_md5() {
 declare -A BACKUP_CONTENT_CACHE
 declare -A MODEL_BLOB_CACHE
 #==============================================================================
-# 检查验证模块 (Model Validation Module)
+# 模型验证模块 (Model Validation Module)
 #==============================================================================
-# 检查模型是否存在
-check_model_exists() {
-	local -n model_info_ref=$1
 
-	case "${model_info_ref[type]}" in
-	"ollama")
-		check_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
-	"hf-gguf")
-		check_hf_gguf_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
-	*)
-		return 1
-		;;
-	esac
-}
 # 验证模型格式是否正确
 validate_model_format() {
 	local model_spec="$1"
@@ -1070,6 +1026,51 @@ _perform_files_restore() {
 		return 1
 	fi
 
+	return 0
+}
+
+#==============================================================================
+# 日志系统模块
+#==============================================================================
+# 日志规则:
+# 1. 主流程函数: 使用标准日志函数(log_info, log_success, log_warning, log_error)
+#    - 在普通模式和verbose模式下都显示, 用于用户关心的核心操作进度
+# 2. 工具函数: 正常追踪日志使用verbose版本(log_verbose, log_verbose_success)
+#    - 仅在verbose模式显示, 警告和错误(log_warning, log_error)在任何模式都显示
+# 3. 避免日志重复: 工具函数的追踪信息只在verbose模式显示, 主流程保持简洁
+#==============================================================================
+
+log_info() {
+	printf "${BLUE}[INFO]${NC} %s\n" "$1"
+}
+
+log_success() {
+	printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
+}
+
+log_warning() {
+	printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
+}
+
+log_error() {
+	printf "${RED}[ERROR]${NC} %s\n" "$1"
+}
+
+# Verbose-only logging functions
+log_verbose() {
+	if [[ ${VERBOSE} == "true" ]]; then
+		printf "${BLUE}[INFO]${NC} %s\n" "$1"
+	fi
+	return 0
+}
+
+log_verbose_success() {
+	[[ ${VERBOSE} == "true" ]] && printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
+	return 0
+}
+
+log_verbose_warning() {
+	[[ ${VERBOSE} == "true" ]] && printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
 	return 0
 }
 
@@ -2824,6 +2825,440 @@ main() {
 	if [[ ${CHECK_ONLY} == "true" ]]; then
 		log_info "检查模式完成，未执行实际下载"
 	fi
+}
+
+# ==================================================================================
+#                           Docker Compose生成功能
+# ==================================================================================
+
+# 生成docker-compose.yaml文件
+update_existing_compose() {
+	local output_file="$1"
+	local custom_models="$2"
+	local default_model="$3"
+
+	log_info "更新现有docker-compose.yaml文件中的CUSTOM_MODELS配置"
+
+	# 创建备份
+	local backup_file
+	backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
+	cp "${output_file}" "${backup_file}"
+	log_info "已备份所有文件: ${backup_file}"
+
+	# 使用Python脚本更新CUSTOM_MODELS环境变量
+	if grep -q "CUSTOM_MODELS=" "${output_file}"; then
+		# 使用Python来精确处理YAML文件中的多行CUSTOM_MODELS
+		# 使用临时文件存储多行内容
+		local temp_models_file
+		temp_models_file=$(mktemp)
+		echo "${custom_models}" >"${temp_models_file}"
+
+		# 使用纯shell实现替换功能
+		update_docker_compose_models() {
+			local file_path="$1"
+			local models_file="$2"
+			local default_model="$3"
+
+			# 读取新的模型配置
+			local new_models
+			new_models=$(cat "${models_file}")
+
+			# 创建临时文件
+			local temp_file
+			temp_file=$(mktemp)
+
+			# 简单替换CUSTOM_MODELS行
+			if grep -q 'CUSTOM_MODELS=' "${file_path}"; then
+				# 使用sed进行简单的行替换
+				sed "s|CUSTOM_MODELS=.*|CUSTOM_MODELS=${new_models}\"|" "${file_path}" >"${temp_file}"
+				cp "${temp_file}" "${file_path}"
+			fi
+
+			# 处理DEFAULT_MODEL替换
+			sed -E "s|(^[[:space:]]*-[[:space:]]*DEFAULT_MODEL=)[^[:space:]#]*(.*)|\\1${default_model}  # 自动设置为models.list第一个模型|" "${file_path}" >"${temp_file}"
+			cp "${temp_file}" "${file_path}"
+
+			# 清理临时文件
+			rm -f "${temp_file}"
+			return 0
+		}
+
+		if update_docker_compose_models "${output_file}" "${temp_models_file}" "${default_model}"; then
+			echo "SUCCESS"
+		else
+			echo "ERROR: Failed to update docker-compose.yaml"
+			exit 1
+		fi
+
+		# 清理临时文件
+		rm -f "${temp_models_file}"
+
+		log_success "成功更新docker-compose.yaml中的CUSTOM_MODELS配置"
+		log_info "更新内容: ${custom_models}"
+	else
+		log_error "未在docker-compose.yaml中找到CUSTOM_MODELS配置"
+		return 1
+	fi
+
+	return 0
+}
+
+generate_docker_compose() {
+	local output_file="${1:-./docker-compose.yaml}"
+	local models_file="${MODELS_FILE:-./models.list}"
+
+	# 检查模型列表文件是否存在
+	if [[ ! -f ${models_file} ]]; then
+		log_error "模型列表文件不存在: ${models_file}"
+		return 1
+	fi
+
+	# 检查是否已存在docker-compose.yaml文件
+	if [[ -f ${output_file} ]]; then
+		log_info "检测到现有docker-compose.yaml文件，将更新CUSTOM_MODELS配置"
+
+		# 生成CUSTOM_MODELS内容
+		local custom_models_content
+		custom_models_content=$(generate_custom_models_list "${models_file}")
+
+		if [[ -z ${custom_models_content} ]]; then
+			log_warning "未找到激活的模型，将生成默认配置"
+			custom_models_content="-all"
+		fi
+
+		# 检查是否有可用的模型
+		if [[ ${custom_models_content} == "-all" ]]; then
+			log_error "错误: models.list 中没有找到可用的模型配置"
+			log_error "请确保 models.list 中至少有一个未被注释的模型配置"
+			return 1
+		fi
+
+		# 自动检测默认模型
+		local default_model
+		default_model=$(detect_default_model "${models_file}")
+
+		[[ -n ${VERBOSE} ]] && log_info "Generated CUSTOM_MODELS content"
+		[[ -n ${VERBOSE} ]] && log_info "Detected default model: ${default_model}"
+
+		# 更新现有文件
+		update_existing_compose "${output_file}" "${custom_models_content}" "${default_model}"
+	else
+		log_info "Generating docker-compose.yaml based on model list: ${models_file}"
+
+		# 生成CUSTOM_MODELS内容
+		local custom_models_content
+		custom_models_content=$(generate_custom_models_list "${models_file}")
+
+		if [[ -z ${custom_models_content} ]]; then
+			log_warning "未找到激活的模型，将生成默认配置"
+			custom_models_content="-all"
+		fi
+
+		# 自动检测默认模型
+		local default_model
+		default_model=$(detect_default_model "${models_file}")
+
+		# 检查是否有可用的模型 (CUSTOM_MODELS只有-all说明没有激活的模型)
+		if [[ ${custom_models_content} == "-all" ]]; then
+			log_error "错误: models.list 中没有找到可用的模型配置"
+			log_error "请确保 models.list 中至少有一个未被注释的模型配置"
+			return 1
+		fi
+
+		[[ -n ${VERBOSE} ]] && log_info "Generated CUSTOM_MODELS content"
+		[[ -n ${VERBOSE} ]] && log_info "Detected default model: ${default_model}"
+
+		# 生成docker-compose.yaml内容
+		generate_compose_content "${output_file}" "${custom_models_content}" "${default_model}"
+	fi
+}
+
+# 生成CUSTOM_MODELS列表
+generate_custom_models_list() {
+	local models_file="$1"
+	local custom_models_entries=()
+
+	# 添加 -all 作为第一个条目（隐藏所有默认模型）
+	custom_models_entries+=("-all")
+
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		# 跳过注释行和空行
+		[[ ${line} =~ ^[[:space:]]*# ]] && continue
+		[[ -z ${line// /} ]] && continue
+
+		# 解析行内容
+		read -r model_type model_spec _ <<<"${line}"
+
+		case "${model_type}" in
+		"ollama")
+			if [[ -n ${model_spec} ]]; then
+				local alias
+				alias=$(generate_model_alias "${model_spec}" "ollama")
+				local entry="+${model_spec}@OpenAI=${alias}"
+				custom_models_entries+=("${entry}")
+			fi
+			;;
+		"hf-gguf")
+			if [[ -n ${model_spec} ]]; then
+				local alias
+				alias=$(generate_model_alias "${model_spec}" "hf-gguf")
+				local entry="+${model_spec}@OpenAI=${alias}"
+				custom_models_entries+=("${entry}")
+			fi
+			;;
+		*)
+			# 忽略未知的模型类型
+			;;
+		esac
+	done <"${models_file}"
+
+	# 输出CUSTOM_MODELS格式
+	if [[ ${#custom_models_entries[@]} -gt 1 ]]; then
+		printf '%s' "${custom_models_entries[0]}"
+		for ((i = 1; i < ${#custom_models_entries[@]}; i++)); do
+			printf ',\\\n        %s' "${custom_models_entries[i]}"
+		done
+	else
+		echo "-all"
+	fi
+}
+
+# 生成简单的模型别名
+generate_model_alias() {
+	local model_spec="$1"
+	local model_type="$2"
+
+	# 根据模型类型提取实际的模型名称
+	local model_name=""
+	local model_version=""
+
+	case "${model_type}" in
+	"hf-gguf")
+		# 对于 hf-gguf 模型，从路径中提取模型名称
+		# 格式如: hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
+		if [[ ${model_spec} =~ hf\.co/[^/]+/([^/:]+) ]]; then
+			model_name="${BASH_REMATCH[1]}"
+			# 移除常见的 GGUF 后缀
+			model_name=$(echo "${model_name}" | sed 's/-GGUF$//' | sed 's/_GGUF$//')
+		fi
+		;;
+	*)
+		# 对于 ollama 和其他类型，使用基础名称
+		model_name="${model_spec%:*}"
+		;;
+	esac
+
+	# 从模型规格中提取版本信息
+	if [[ ${model_spec} =~ :(.+)$ ]]; then
+		model_version="${BASH_REMATCH[1]}"
+	fi
+
+	# 如果没有提取到模型名称，使用类型作为后备
+	if [[ -z ${model_name} ]]; then
+		model_name="${model_type}"
+	fi
+
+	# 清理模型名称和版本中的特殊字符
+	local clean_name
+	clean_name=$(echo "${model_name}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+
+	if [[ -n ${model_version} && ${model_version} != "latest" ]]; then
+		local clean_version
+		clean_version=$(echo "${model_version}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+		echo "${clean_name}-${clean_version}"
+	else
+		echo "${clean_name}"
+	fi
+}
+
+# 检测默认模型
+detect_default_model() {
+	local models_file="$1"
+	local first_active_model=""
+
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		# 跳过注释行和空行
+		[[ ${line} =~ ^[[:space:]]*# ]] && continue
+		[[ -z ${line// /} ]] && continue
+
+		# 解析行内容
+		read -r model_type model_spec _ <<<"${line}"
+
+		# 找到第一个激活的模型并生成其别名
+		if [[ -n ${model_spec} && -z ${first_active_model} ]]; then
+			case "${model_type}" in
+			"ollama")
+				first_active_model=$(generate_model_alias "${model_spec}" "ollama")
+				break
+				;;
+			"hf-gguf")
+				first_active_model=$(generate_model_alias "${model_spec}" "hf-gguf")
+				break
+				;;
+			*)
+				# 忽略未知的模型类型
+				;;
+			esac
+		fi
+	done <"${models_file}"
+
+	# 如果没有找到激活的模型，使用默认值
+	echo "${first_active_model:-qwen3-14b}"
+}
+
+# 生成docker-compose.yaml文件内容
+detect_gpus() {
+	local gpu_indices=""
+
+	if command -v nvidia-smi &>/dev/null; then
+		gpu_indices=$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+		if [[ -n ${gpu_indices} ]]; then
+			echo "${gpu_indices}"
+		else
+			echo "0,1,2,3"
+		fi
+	else
+		echo "0,1,2,3"
+	fi
+}
+
+generate_compose_content() {
+	local output_file="$1"
+	local custom_models="$2"
+	local default_model="$3"
+
+	local cuda_devices
+	cuda_devices=$(detect_gpus)
+
+	# 获取主机时区
+	local host_timezone
+	host_timezone=$(get_host_timezone)
+	[[ -z ${host_timezone} ]] && host_timezone="UTC"
+
+	# 如果文件已存在，创建备份
+	if [[ -f ${output_file} ]]; then
+		local backup_file
+		backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
+		cp "${output_file}" "${backup_file}"
+		log_info "已备份所有文件: ${backup_file}"
+	fi
+
+	# 生成docker-compose.yaml内容
+	cat >"${output_file}" <<EOF
+services:
+  ollama:
+    image: ${DOCKER_IMAGE_OLLAMA}
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./ollama:/root/.ollama
+    networks:
+      - llms-tools-network
+    environment:
+      # Ollama优化配置
+      - CUDA_VISIBLE_DEVICES=${cuda_devices} # 自动检测并使用所有可用GPU
+      - OLLAMA_NEW_ENGINE=1 # 新的引擎, ollamarunner
+      - OLLAMA_SCHED_SPREAD=1 # 启用多GPU负载均衡
+      - OLLAMA_KEEP_ALIVE=5m # 模型在内存中保持加载的时长, 分钟
+      - OLLAMA_NUM_PARALLEL=3 # 并发请求数
+      - OLLAMA_FLASH_ATTENTION=1 # flash attention, 用于优化注意力计算, 降低显存使用
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [ gpu ]
+    command: [ "serve"]
+    restart: unless-stopped
+
+  one-api:
+    image: ${DOCKER_IMAGE_ONE_API}
+    container_name: one-api
+    volumes:
+      - ./one-api:/data
+    networks:
+      - llms-tools-network
+    ports:
+      - "3001:3001"
+    depends_on:
+      - ollama
+    environment:
+      - TZ=${host_timezone}
+      - SESSION_SECRET=random_string
+    command: [ "--port", "3001" ]
+    restart: unless-stopped
+
+  prompt-optimizer:
+    image: ${DOCKER_IMAGE_PROMPT_OPTIMIZER}
+    container_name: prompt-optimizer
+    ports:
+      - "8501:80"
+    environment:
+      - VITE_CUSTOM_API_BASE_URL=http://YOUR_SERVER_IP:3001/v1  # 修改为你的服务器IP地址
+      - VITE_CUSTOM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 修改为你的API密钥
+      - VITE_CUSTOM_API_MODEL=${default_model}  # 自动设置为models.list第一个模型
+      - ACCESS_USERNAME=admin  # 修改为你的用户名
+      - ACCESS_PASSWORD=xxxxxxxxxxxxxxxxxxxxxx  # 修改为你的密码
+    networks:
+      - llms-tools-network
+    depends_on:
+      - one-api
+    restart: unless-stopped
+
+  chatgpt-next-web:
+    image: ${DOCKER_IMAGE_CHATGPT_NEXT_WEB}
+    container_name: chatgpt-next-web
+    ports:
+      - "3000:3000"
+    environment:
+      - OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 修改为你的OpenAI API密钥
+      - BASE_URL=http://one-api:3001
+      - PROXY_URL=
+      - "CUSTOM_MODELS=${custom_models}"
+      - DEFAULT_MODEL=${default_model}  # 自动设置为models.list第一个模型
+      - CODE=xxxxxxxxxxxxxxxxxxxxxx  # 修改为你的访问密码
+    networks:
+      - llms-tools-network
+    depends_on:
+      - one-api
+    restart: unless-stopped
+
+networks:
+  llms-tools-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.28.0/24
+EOF
+
+	log_success "成功生成docker-compose.yaml文件: ${output_file}"
+	log_info "包含模型配置: ${custom_models}"
+	log_info "默认模型: ${default_model}"
+	log_info "检测到GPU设备: ${cuda_devices}"
+	echo ""
+	log_info "⚠️  重要提示: 生成的配置文件中包含占位符，请根据以下说明修改："
+	log_info "== 必须修改的配置 =="
+	log_info "1. VITE_CUSTOM_API_BASE_URL: 将 YOUR_SERVER_IP 替换为实际服务器IP地址"
+	log_info "2. VITE_CUSTOM_API_KEY: 替换为 one-api 中的有效API密钥"
+	log_info "3. ACCESS_USERNAME/ACCESS_PASSWORD: 设置 prompt-optimizer 的登录凭据"
+	log_info "4. OPENAI_API_KEY: 替换为 one-api 中的有效API密钥"
+	log_info "5. CODE: 设置 ChatGPT-Next-Web 的访问密码"
+	log_info "6. VITE_CUSTOM_API_MODEL/DEFAULT_MODEL: 已自动设置为 ${default_model}，可根据需要修改"
+	echo ""
+	log_info "== 可选修改的配置 =="
+	log_info "• 端口映射: 如需避免端口冲突，可修改 ports 部分的主机端口"
+	log_info "  - Ollama: 11434 -> 自定义端口"
+	log_info "  - One-API: 3001 -> 自定义端口"
+	log_info "  - Prompt-Optimizer: 8501 -> 自定义端口"
+	log_info "  - ChatGPT-Next-Web: 3000 -> 自定义端口"
+	log_info "• Docker镜像: 如需使用特定版本，可修改 image 部分的标签"
+	log_info "• 网络配置: 可修改 subnet 以避免IP地址冲突"
+	echo ""
+	log_info "配置完成后运行: docker compose up -d 来启动服务"
+
+	return 0
 }
 
 # 只有在直接运行脚本时才执行main函数
