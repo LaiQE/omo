@@ -234,18 +234,18 @@ download_ollama_model() {
 
 # 备份单个模型的包装函数
 backup_single_model() {
-	local backup_model="$1"
+	local -n model_info_ref=$1
 	local backup_dir="$2"
 
-	# 处理不同类型的模型前缀
-	local model_to_backup="${backup_model}"
-	if [[ ${backup_model} =~ ^hf-gguf:(.+)$ ]]; then
-		model_to_backup="${BASH_REMATCH[1]}"
-	elif [[ ${backup_model} =~ ^ollama:(.+)$ ]]; then
-		model_to_backup="${BASH_REMATCH[1]}"
-	fi
-
-	backup_ollama_model "${model_to_backup}" "${backup_dir}"
+	case "${model_info_ref[type]}" in
+	"ollama" | "hf-gguf")
+		backup_ollama_model "${model_info_ref[name]}:${model_info_ref[tag]}" "${backup_dir}"
+		;;
+	*)
+		log_error "Unsupported model type for backup: ${model_info_ref[type]}"
+		return 1
+		;;
+	esac
 }
 
 backup_ollama_model() {
@@ -261,24 +261,30 @@ backup_ollama_model() {
 		return 1
 	fi
 
-	log_verbose "备份模型: ${model_name}:${model_version}"
-	local model_spec="${model_name}:${model_version}"
+	log_verbose "Backing up model: ${model_name}:${model_version}"
+
+	# 验证本地模型完整性
 	if ! verify_integrity "model" "${model_spec}" "use_cache:true,check_blobs:true"; then
-		log_error "本地模型不完整，取消备份操作"
+		log_error "Local model is incomplete, canceling backup operation"
 		return 1
 	fi
 
-	# 创建备份目录和生成路径
-	local model_backup_dir
-	model_backup_dir=$(create_model_backup_dir "${model_spec}" "${backup_dir}") || return 1
+	# 获取安全的模型名称和创建备份目录
 	local model_safe_name
 	model_safe_name=$(get_safe_model_name "${model_spec}")
+	local model_backup_dir="${backup_dir}/${model_safe_name}"
 	local backup_model_dir="${model_backup_dir}/${model_safe_name}"
 
 	# 检查是否已存在备份目录
 	if [[ -d ${backup_model_dir} ]]; then
-		log_success "模型备份已存在"
+		log_success "Model backup already exists"
 		return 0
+	fi
+
+	# 创建备份目录
+	if ! mkdir -p "${model_backup_dir}"; then
+		log_error "Unable to create backup directory: ${model_backup_dir}"
+		return 1
 	fi
 
 	# 确定manifest文件路径
@@ -287,7 +293,8 @@ backup_ollama_model() {
 
 	# 检查manifest文件是否存在
 	if [[ ! -f ${manifest_file} ]]; then
-		log_error "模型不存在: ${model_spec}"
+		log_error "Model does not exist: ${model_spec}"
+		rm -rf "${model_backup_dir}"
 		return 1
 	fi
 
@@ -296,53 +303,55 @@ backup_ollama_model() {
 	blob_files=$(get_model_blob_paths "${manifest_file}" "${OLLAMA_MODELS_DIR}")
 
 	if [[ -z ${blob_files} ]]; then
-		log_error "未找到模型相关的blob文件"
+		log_error "No model-related blob files found"
+		rm -rf "${model_backup_dir}"
 		return 1
 	fi
 
 	# 创建备份目录结构
-	mkdir -p "${backup_model_dir}/manifests"
-	mkdir -p "${backup_model_dir}/blobs"
+	mkdir -p "${backup_model_dir}/manifests" "${backup_model_dir}/blobs"
 
-	log_verbose "开始复制文件..."
+	log_verbose "Starting file copy..."
 
 	# 复制manifest文件
 	local manifest_rel_path="${manifest_file#"${OLLAMA_MODELS_DIR}"/manifests/}"
-	local manifest_backup_dir
-	manifest_backup_dir="${backup_model_dir}/manifests/$(dirname "${manifest_rel_path}")"
+	local manifest_backup_dir="${backup_model_dir}/manifests/$(dirname "${manifest_rel_path}")"
 	mkdir -p "${manifest_backup_dir}"
 	if ! cp "${manifest_file}" "${manifest_backup_dir}/"; then
-		log_error "复制manifest文件失败: ${manifest_file}"
-		rm -rf "${backup_model_dir}"
+		log_error "Failed to copy manifest file: ${manifest_file}"
+		rm -rf "${model_backup_dir}"
 		return 1
 	fi
 
 	# 复制blob文件
 	while IFS= read -r blob_file; do
 		if [[ -f ${blob_file} ]]; then
-			local blob_name
-			blob_name=$(basename "${blob_file}")
 			if ! cp "${blob_file}" "${backup_model_dir}/blobs/"; then
-				log_error "复制blob文件失败: ${blob_file}"
-				rm -rf "${backup_model_dir}"
+				log_error "Failed to copy blob file: ${blob_file}"
+				rm -rf "${model_backup_dir}"
 				return 1
 			fi
 		fi
 	done <<<"${blob_files}"
 
+	# 设置备份目录权限为755
+	chmod -R 755 "${backup_model_dir}" || log_warning "Failed to set directory permissions"
+
 	# 计算MD5校验
-	log_verbose "计算MD5校验值..."
+	log_verbose "Calculating MD5 checksums..."
 	local md5_file="${backup_model_dir}.md5"
 	if calculate_directory_md5 "${backup_model_dir}" "${md5_file}"; then
-		log_verbose "MD5校验文件已创建: ${md5_file}"
+		log_verbose "MD5 checksum file created: ${md5_file}"
+		# 设置MD5文件权限为644
+		chmod 644 "${md5_file}" || log_warning "Failed to set MD5 file permissions"
 	else
-		log_warning "MD5校验文件创建失败"
+		log_warning "Failed to create MD5 checksum file"
 	fi
 
 	# 创建备份信息文件
 	create_backup_info "${model_spec}" "${backup_model_dir}" "directory" 1 "ollama"
 
-	log_verbose_success "模型备份完成: ${model_spec}"
+	log_verbose_success "Model backup completed: ${model_spec}"
 	return 0
 }
 
@@ -350,34 +359,226 @@ backup_ollama_model() {
 # 模型恢复模块 (Model Restore Module)
 #==============================================================================
 
-# 恢复模型的包装函数
+# 恢复模型的统一入口函数（从文件路径恢复）
 restore_model() {
 	local restore_file="$1"
-	local force_restore="$2"
+	local force_restore="${2:-false}"
 
-	# 如果恢复文件不是绝对路径，则在BACKUP_OUTPUT_DIR中查找
+	# 处理路径解析
 	local restore_path="${restore_file}"
 	if [[ ${restore_file} != /* ]]; then
 		restore_path="${BACKUP_OUTPUT_DIR}/${restore_file}"
 	fi
 
-	restore_ollama_model "${restore_path}" "${force_restore}"
+	# 检查路径是否存在
+	if [[ ! -d ${restore_path} ]]; then
+		log_error "Backup directory does not exist: ${restore_path}"
+		return 1
+	fi
+
+	# 分发到具体的恢复实现
+	_restore_by_type "ollama" "${restore_path}" "${force_restore}"
 }
 
-# 尝试从备份恢复模型
+# 尝试从备份自动恢复模型（从模型信息恢复）
 try_restore_model() {
 	local -n model_info_ref=$1
 
-	# 所有支持的模型类型都使用相同的恢复方法
 	case "${model_info_ref[type]}" in
 	"ollama" | "hf-gguf")
-		try_restore_ollama_from_backup "${model_info_ref[name]}" "${model_info_ref[tag]}"
+		_auto_restore_from_backup "${model_info_ref[type]}" "${model_info_ref[name]}" "${model_info_ref[tag]}"
 		;;
 	*)
-		log_error "Unsupported model type: ${model_info_ref[type]}"
+		log_error "Unsupported model type for restore: ${model_info_ref[type]}"
 		return 1
 		;;
 	esac
+}
+
+# 内部函数：按类型分发恢复（统一接口）
+_restore_by_type() {
+	local model_type="$1"
+	local backup_path="$2"
+	local force_restore="${3:-false}"
+
+	case "${model_type}" in
+	"ollama" | "hf-gguf")
+		_restore_ollama_implementation "${backup_path}" "${force_restore}"
+		;;
+	*)
+		log_error "Unsupported model type for restore: ${model_type}"
+		return 1
+		;;
+	esac
+}
+
+# 内部函数：自动恢复实现
+_auto_restore_from_backup() {
+	local model_type="$1"
+	local model_name="$2"
+	local model_tag="$3"
+	local model_spec="${model_name}:${model_tag}"
+
+	log_verbose "Checking for model backup: ${model_spec}"
+
+	# 生成备份路径
+	local model_safe_name
+	model_safe_name=$(get_safe_model_name "${model_spec}")
+	local backup_base_dir="${BACKUP_OUTPUT_DIR}/${model_safe_name}"
+	local backup_model_dir="${backup_base_dir}/${model_safe_name}"
+
+	# 检查备份是否存在
+	if [[ ! -d ${backup_model_dir} ]]; then
+		log_verbose "No backup found: ${backup_model_dir}"
+		return 1
+	fi
+
+	log_verbose_success "Found model backup: ${backup_model_dir}"
+	log_info "Restoring model from backup..."
+
+	# 调用统一的恢复实现
+	if _restore_by_type "${model_type}" "${backup_model_dir}" "true"; then
+		log_success "Successfully restored model from backup: ${model_spec}"
+		return 0
+	else
+		log_warning "Failed to restore model from backup"
+		return 1
+	fi
+}
+
+# 内部函数：Ollama模型恢复的核心实现
+_restore_ollama_implementation() {
+	local backup_dir="$1"
+	local force_restore="${2:-false}"
+
+	log_info "Restoring model: $(basename "${backup_dir}")"
+
+	# 验证备份结构
+	if ! _validate_backup_structure "${backup_dir}"; then
+		return 1
+	fi
+
+	# 执行完整性校验
+	if ! _verify_backup_integrity "${backup_dir}" "${force_restore}"; then
+		return 1
+	fi
+
+	# 检查文件冲突
+	if ! _check_restore_conflicts "${backup_dir}" "${force_restore}"; then
+		return 1
+	fi
+
+	# 执行文件恢复
+	if ! _perform_files_restore "${backup_dir}"; then
+		return 1
+	fi
+
+	log_verbose_success "Model restore completed"
+	return 0
+}
+
+# 内部函数：验证备份结构
+_validate_backup_structure() {
+	local backup_dir="$1"
+
+	if [[ ! -d ${backup_dir} ]]; then
+		log_error "Backup directory does not exist: ${backup_dir}"
+		return 1
+	fi
+
+	if [[ ! -d "${backup_dir}/manifests" ]] || [[ ! -d "${backup_dir}/blobs" ]]; then
+		log_error "Invalid backup structure: missing manifests or blobs directory"
+		return 1
+	fi
+
+	return 0
+}
+
+# 内部函数：验证备份完整性
+_verify_backup_integrity() {
+	local backup_dir="$1"
+	local force_restore="$2"
+
+	local md5_file="${backup_dir}.md5"
+	if [[ ! -f ${md5_file} ]]; then
+		log_warning "Skipping integrity check: MD5 file not found"
+		return 0
+	fi
+
+	log_info "Verifying backup integrity..."
+	if verify_directory_md5 "${backup_dir}" "${md5_file}"; then
+		log_verbose_success "MD5 verification passed"
+		return 0
+	else
+		log_error "Backup integrity check failed"
+		if [[ ${force_restore} == "true" ]]; then
+			log_warning "Force restore mode, continuing..."
+			return 0
+		else
+			return 1
+		fi
+	fi
+}
+
+# 内部函数：检查恢复冲突
+_check_restore_conflicts() {
+	local backup_dir="$1"
+	local force_restore="$2"
+
+	if [[ ${force_restore} == "true" ]]; then
+		return 0
+	fi
+
+	log_info "Checking for file conflicts..."
+	local conflicts_found=false
+
+	for backup_subdir in manifests blobs; do
+		if find "${backup_dir}/${backup_subdir}" -type f 2>/dev/null | while read -r backup_file; do
+			local rel_path="${backup_file#"${backup_dir}/${backup_subdir}"/}"
+			local target_file="${OLLAMA_MODELS_DIR}/${backup_subdir}/${rel_path}"
+			if [[ -f ${target_file} ]]; then
+				echo "conflict"
+				break
+			fi
+		done | grep -q "conflict"; then
+			conflicts_found=true
+			break
+		fi
+	done
+
+	if [[ ${conflicts_found} == "true" ]]; then
+		log_error "File conflicts detected, use --force to override"
+		return 1
+	fi
+
+	return 0
+}
+
+# 内部函数：执行文件恢复
+_perform_files_restore() {
+	local backup_dir="$1"
+
+	# 创建目标目录
+	if ! mkdir -p "${OLLAMA_MODELS_DIR}/manifests" "${OLLAMA_MODELS_DIR}/blobs"; then
+		log_error "Failed to create Ollama directories"
+		return 1
+	fi
+
+	# 恢复manifest文件
+	log_verbose "Restoring model manifests..."
+	if ! cp -r "${backup_dir}/manifests/"* "${OLLAMA_MODELS_DIR}/manifests/"; then
+		log_error "Failed to restore manifest files"
+		return 1
+	fi
+
+	# 恢复blob文件
+	log_verbose "Restoring model data..."
+	if ! cp "${backup_dir}/blobs/"* "${OLLAMA_MODELS_DIR}/blobs/"; then
+		log_error "Failed to restore blob files"
+		return 1
+	fi
+
+	return 0
 }
 
 #==============================================================================
@@ -1848,6 +2049,8 @@ EOF
 
 	# 直接写入信息文件
 	if mv "${temp_info}" "${info_file}"; then
+		# 设置备份信息文件权限为644
+		chmod 644 "${info_file}" || log_warning "设置备份信息文件权限失败"
 		log_verbose_success "Backup info file created: $(basename "${info_file}")"
 	else
 		log_error "Unable to write backup info file: ${info_file}"
@@ -2092,92 +2295,6 @@ remove_model_smart() {
 }
 
 # 检测备份文件类型
-
-# 恢复Ollama模型（目录备份）
-restore_ollama_model() {
-	local backup_dir="$1"
-	local force_restore="$2"
-
-	log_info "恢复模型: $(basename "${backup_dir}")"
-
-	# 检查备份目录是否存在
-	if [[ ! -d ${backup_dir} ]]; then
-		log_error "备份文件不存在: ${backup_dir}"
-		return 1
-	fi
-
-	# 检查备份目录结构
-	if [[ ! -d "${backup_dir}/manifests" ]] || [[ ! -d "${backup_dir}/blobs" ]]; then
-		log_error "备份文件损坏或格式错误"
-		return 1
-	fi
-
-	# MD5校验
-	local md5_file="${backup_dir}.md5"
-	if [[ -f ${md5_file} ]]; then
-		log_info "校验备份文件..."
-		if verify_directory_md5 "${backup_dir}" "${md5_file}"; then
-			log_verbose_success "MD5校验通过"
-		else
-			log_error "备份文件校验失败，可能已损坏"
-			if [[ ${force_restore} != "true" ]]; then
-				return 1
-			fi
-			log_warning "强制恢复模式，继续操作..."
-		fi
-	else
-		log_warning "跳过完整性校验"
-	fi
-
-	# 检查是否需要强制覆盖
-	if [[ ${force_restore} != "true" ]]; then
-		log_info "检查模型冲突..."
-		local conflicts_found=false
-
-		# 检查manifests和blobs冲突
-		for backup_subdir in manifests blobs; do
-			if find "${backup_dir}/${backup_subdir}" -type f 2>/dev/null | while read -r backup_file; do
-				local rel_path="${backup_file#"${backup_dir}/${backup_subdir}"/}"
-				local target_file="${OLLAMA_MODELS_DIR}/${backup_subdir}/${rel_path}"
-				if [[ -f ${target_file} ]]; then
-					echo "conflict"
-					break
-				fi
-			done | grep -q "conflict"; then
-				conflicts_found=true
-				break
-			fi
-		done
-
-		if [[ ${conflicts_found} == "true" ]]; then
-			log_error "检测到文件冲突，使用 --force 强制覆盖"
-			return 1
-		fi
-	fi
-
-	# 创建Ollama目录并设置权限
-	if ! mkdir -p "${OLLAMA_MODELS_DIR}/manifests" "${OLLAMA_MODELS_DIR}/blobs"; then
-		log_error "Unable to创建Ollama目录"
-		return 1
-	fi
-
-	# 复制manifests
-	log_verbose "恢复模型信息..."
-	if ! cp -r "${backup_dir}/manifests/"* "${OLLAMA_MODELS_DIR}/manifests/"; then
-		log_error "manifest文件复制失败"
-		return 1
-	fi
-
-	# 复制blobs
-	log_verbose "恢复模型数据..."
-	if ! cp "${backup_dir}/blobs/"* "${OLLAMA_MODELS_DIR}/blobs/"; then
-		log_error "blob文件复制失败"
-		return 1
-	fi
-
-	log_verbose_success "模型恢复完成"
-	return 0
-}
 
 # 自动识别备份类型并恢复
 # 批量备份模型（根据models.list文件）
@@ -2426,67 +2543,6 @@ remove_models_from_list() {
 # 检查Ollama中是否存在指定模型（通用函数）
 
 # 检查Ollama模型在backups目录中是否有备份
-check_ollama_backup_exists() {
-	local model_name="$1"
-	local model_tag="$2"
-
-	# 使用与get_safe_model_name相同的逻辑生成安全名称
-	local model_spec="${model_name}:${model_tag}"
-	local model_safe_name
-	model_safe_name=$(get_safe_model_name "${model_spec}")
-	local backup_parent_dir="${BACKUP_OUTPUT_DIR}/${model_safe_name}"
-	local backup_model_dir="${backup_parent_dir}/${model_safe_name}"
-
-	# 检查备份目录是否存在
-	if [[ -d ${backup_model_dir} ]]; then
-		# 检查是否有有效的目录备份结构
-		if [[ -d "${backup_model_dir}/manifests" ]] && [[ -d "${backup_model_dir}/blobs" ]]; then
-			echo "${backup_parent_dir}"
-			return 0
-		fi
-	fi
-
-	return 1
-}
-
-# 尝试从备份恢复Ollama模型
-try_restore_ollama_from_backup() {
-	local model_name="$1"
-	local model_tag="$2"
-
-	log_verbose "检查Ollama模型备份: ${model_name}:${model_tag}"
-
-	local backup_dir
-	if backup_dir=$(check_ollama_backup_exists "${model_name}" "${model_tag}"); then
-		log_verbose_success "找到Ollama模型备份: ${backup_dir}"
-
-		# 使用与get_safe_model_name相同的逻辑生成安全名称
-		local model_spec="${model_name}:${model_tag}"
-		local model_safe_name
-		model_safe_name=$(get_safe_model_name "${model_spec}")
-
-		# 查找备份目录（新的直接复制格式）
-		local backup_model_dir="${backup_dir}/${model_safe_name}"
-		if [[ -d ${backup_model_dir} ]]; then
-			# 恢复模型
-			log_info "正在从备份恢复模型..."
-			if restore_ollama_model "${backup_model_dir}" "true"; then
-				log_success "从备份成功恢复模型: ${model_name}:${model_tag}"
-				return 0
-			else
-				log_warning "从备份恢复模型失败，将尝试重新下载"
-				return 1
-			fi
-		else
-			log_error "未找到有效的备份目录: ${backup_model_dir}"
-			return 1
-		fi
-	else
-		log_verbose "未找到Ollama模型备份"
-		return 1
-	fi
-}
-
 # 处理单个模型
 process_model() {
 	local model_entry="$1"
@@ -2684,7 +2740,14 @@ main() {
 
 	# 执行特定任务并退出
 	if [[ -n ${BACKUP_MODEL} ]]; then
-		execute_task "model backup" backup_single_model "${BACKUP_MODEL}" "${BACKUP_OUTPUT_DIR}"
+		# 解析模型信息
+		local -A model_info
+		if parse_model_entry "${BACKUP_MODEL}" model_info; then
+			execute_task "model backup" backup_single_model model_info "${BACKUP_OUTPUT_DIR}"
+		else
+			log_error "Invalid model format: ${BACKUP_MODEL}"
+			exit 1
+		fi
 	elif [[ ${BACKUP_ALL} == "true" ]]; then
 		execute_task "batch backup" backup_models_from_list "${MODELS_FILE}" "${BACKUP_OUTPUT_DIR}"
 	elif [[ ${LIST_MODELS} == "true" ]]; then
