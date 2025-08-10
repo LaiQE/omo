@@ -316,3 +316,5 @@ user_*.sh
 !CONTRIBUTING.md
 !docs/
 !examples/
+
+.trunk
