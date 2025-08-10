@@ -317,4 +317,10 @@ user_*.sh
 !docs/
 !examples/
 
-.trunk
+# Trunk - only ignore runtime files, keep configs
+.trunk/actions
+.trunk/logs
+.trunk/notifications
+.trunk/out
+.trunk/tools
+.trunk/plugins

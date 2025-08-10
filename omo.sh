@@ -582,7 +582,7 @@ validate_model_business_integrity() {
 	local manifest_files=()
 	while IFS= read -r -d '' manifest; do
 		manifest_files+=("${manifest}")
-	done < <(find "${temp_dir}" -path "*/manifests/*" -type f -print0 2>/dev/null)
+	done < <(find "${temp_dir}" -path "*/manifests/*" -type f -print0 2>/dev/null || true)
 
 	if [[ ${#manifest_files[@]} -eq 0 ]]; then
 		log_error "Manifest file not found in backup"
@@ -712,6 +712,7 @@ check_ollama_model() {
 }
 
 # 解析模型规格（model:version格式）
+# shellcheck disable=SC2034  # nameref variables are used by reference
 parse_model_spec() {
 	local model_spec="$1"
 	local -n name_var="$2"
@@ -1477,6 +1478,9 @@ verify_integrity() {
 				model_spec:*)
 					model_spec="${i#*:}"
 					;;
+				*)
+					# 忽略未知选项
+					;;
 				esac
 			done
 		done <<<"${options}"
@@ -1752,9 +1756,11 @@ EOF
 		if [[ -f ${md5_file} ]]; then
 			cat "${md5_file}" >>"${temp_info}"
 		else
-			echo "  MD5校验文件创建失败或不存在" >>"${temp_info}"
-			echo "  文件路径: ${md5_file}" >>"${temp_info}"
-			echo "  建议: 重新运行备份以生成MD5校验文件" >>"${temp_info}"
+			{
+				echo "  MD5校验文件创建失败或不存在"
+				echo "  文件路径: ${md5_file}"
+				echo "  建议: 重新运行备份以生成MD5校验文件"
+			} >>"${temp_info}"
 		fi
 
 		cat >>"${temp_info}" <<EOF
@@ -1848,7 +1854,7 @@ list_installed_models() {
 	local manifest_files=()
 	while IFS= read -r -d '' manifest_file; do
 		manifest_files+=("${manifest_file}")
-	done < <(find "${manifests_base_dir}" -type f -print0 2>/dev/null)
+	done < <(find "${manifests_base_dir}" -type f -print0 2>/dev/null || true)
 
 	# 按模型组织 manifest 文件
 	declare -A model_manifests
@@ -1969,7 +1975,8 @@ list_installed_models() {
 					fi
 
 					# 格式化大小显示
-					local human_size=$(format_bytes "${total_model_size}")
+					local human_size
+					human_size=$(format_bytes "${total_model_size}")
 
 					echo "   ├─ 大小: ${human_size}"
 
@@ -1994,15 +2001,18 @@ list_installed_models() {
 
 	# 格式化总大小
 	if [[ ${VERBOSE} == "true" ]]; then
-		local total_human_size=$(format_bytes "${total_size}")
+		local total_human_size
+		total_human_size=$(format_bytes "${total_size}")
 		echo "  💾 大小: ${total_human_size}"
 	fi
 	echo "  📁 目录: ${OLLAMA_MODELS_DIR}"
 
 	# 显示磁盘使用情况
 	local disk_usage
-	if disk_usage=$(du -sh "${OLLAMA_MODELS_DIR}" 2>/dev/null); then
-		echo "  🗄️ Disk usage: $(echo "$disk_usage" | cut -f1)"
+	if disk_usage=$(du -sh "${OLLAMA_MODELS_DIR}" 2>/dev/null || true); then
+		local disk_size
+		disk_size=$(echo "${disk_usage}" | cut -f1)
+		echo "  🗄️ Disk usage: ${disk_size}"
 	fi
 
 	echo "=================================================================================="
@@ -2083,7 +2093,8 @@ backup_ollama_model() {
 
 	# 复制manifest文件
 	local manifest_rel_path="${manifest_file#"${OLLAMA_MODELS_DIR}"/manifests/}"
-	local manifest_backup_dir="${backup_model_dir}/manifests/$(dirname "${manifest_rel_path}")"
+	local manifest_backup_dir
+	manifest_backup_dir="${backup_model_dir}/manifests/$(dirname "${manifest_rel_path}")"
 	mkdir -p "${manifest_backup_dir}"
 	if ! cp "${manifest_file}" "${manifest_backup_dir}/"; then
 		log_error "复制manifest文件失败: ${manifest_file}"
@@ -2094,7 +2105,8 @@ backup_ollama_model() {
 	# 复制blob文件
 	while IFS= read -r blob_file; do
 		if [[ -f ${blob_file} ]]; then
-			local blob_name=$(basename "${blob_file}")
+			local blob_name
+			blob_name=$(basename "${blob_file}")
 			if ! cp "${blob_file}" "${backup_model_dir}/blobs/"; then
 				log_error "复制blob文件失败: ${blob_file}"
 				rm -rf "${backup_model_dir}"
@@ -2208,7 +2220,8 @@ restore_ollama_model() {
 
 		# 检查blobs冲突
 		if find "${backup_dir}/blobs" -type f 2>/dev/null | while read -r blob_file; do
-			local blob_name=$(basename "${blob_file}")
+			local blob_name
+			blob_name=$(basename "${blob_file}")
 			local target_file="${OLLAMA_MODELS_DIR}/blobs/${blob_name}"
 			if [[ -f ${target_file} ]]; then
 				echo "conflict"
@@ -2357,8 +2370,10 @@ backup_models_from_list() {
 	# 显示备份目录信息
 	if [[ ${VERBOSE} == "true" ]] && [[ -d ${backup_dir} ]]; then
 		# 只统计顶级模型目录，排除子目录
-		local backup_count=$(find "${backup_dir}" -maxdepth 1 -type d ! -path "${backup_dir}" | wc -l)
-		local total_size=$(du -sh "${backup_dir}" 2>/dev/null | cut -f1)
+		local backup_count
+		backup_count=$(find "${backup_dir}" -maxdepth 1 -type d ! -path "${backup_dir}" | wc -l)
+		local total_size
+		total_size=$(du -sh "${backup_dir}" 2>/dev/null | cut -f1)
 		log_info "备份目录下共有: ${backup_count} 个模型，总大小: ${total_size}"
 	fi
 
@@ -2823,7 +2838,8 @@ update_existing_compose() {
 	log_info "更新现有docker-compose.yaml文件中的CUSTOM_MODELS配置"
 
 	# 创建备份
-	local backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
+	local backup_file
+	backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
 	cp "${output_file}" "${backup_file}"
 	log_info "已备份所有文件: ${backup_file}"
 
@@ -2831,7 +2847,8 @@ update_existing_compose() {
 	if grep -q "CUSTOM_MODELS=" "${output_file}"; then
 		# 使用Python来精确处理YAML文件中的多行CUSTOM_MODELS
 		# 使用临时文件存储多行内容
-		local temp_models_file=$(mktemp)
+		local temp_models_file
+		temp_models_file=$(mktemp)
 		echo "${custom_models}" >"${temp_models_file}"
 
 		# 使用纯shell实现替换功能
@@ -2845,7 +2862,8 @@ update_existing_compose() {
 			new_models=$(cat "${models_file}")
 
 			# 创建临时文件
-			local temp_file=$(mktemp)
+			local temp_file
+			temp_file=$(mktemp)
 
 			# 简单替换CUSTOM_MODELS行
 			if grep -q 'CUSTOM_MODELS=' "${file_path}"; then
@@ -2972,17 +2990,22 @@ generate_custom_models_list() {
 		case "${model_type}" in
 		"ollama")
 			if [[ -n ${model_spec} ]]; then
-				local alias=$(generate_model_alias "${model_spec}" "ollama")
+				local alias
+				alias=$(generate_model_alias "${model_spec}" "ollama")
 				local entry="+${model_spec}@OpenAI=${alias}"
 				custom_models_entries+=("${entry}")
 			fi
 			;;
 		"hf-gguf")
 			if [[ -n ${model_spec} ]]; then
-				local alias=$(generate_model_alias "${model_spec}" "hf-gguf")
+				local alias
+				alias=$(generate_model_alias "${model_spec}" "hf-gguf")
 				local entry="+${model_spec}@OpenAI=${alias}"
 				custom_models_entries+=("${entry}")
 			fi
+			;;
+		*)
+			# 忽略未知的模型类型
 			;;
 		esac
 	done <"${models_file}"
@@ -3034,10 +3057,12 @@ generate_model_alias() {
 	fi
 
 	# 清理模型名称和版本中的特殊字符
-	local clean_name=$(echo "${model_name}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+	local clean_name
+	clean_name=$(echo "${model_name}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
 
 	if [[ -n ${model_version} && ${model_version} != "latest" ]]; then
-		local clean_version=$(echo "${model_version}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
+		local clean_version
+		clean_version=$(echo "${model_version}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
 		echo "${clean_name}-${clean_version}"
 	else
 		echo "${clean_name}"
@@ -3067,6 +3092,9 @@ detect_default_model() {
 			"hf-gguf")
 				first_active_model=$(generate_model_alias "${model_spec}" "hf-gguf")
 				break
+				;;
+			*)
+				# 忽略未知的模型类型
 				;;
 			esac
 		fi
@@ -3101,12 +3129,14 @@ generate_compose_content() {
 	cuda_devices=$(detect_gpus)
 
 	# 获取主机时区
-	local host_timezone=$(get_host_timezone)
+	local host_timezone
+	host_timezone=$(get_host_timezone)
 	[[ -z ${host_timezone} ]] && host_timezone="UTC"
 
 	# 如果文件已存在，创建备份
 	if [[ -f ${output_file} ]]; then
-		local backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
+		local backup_file
+		backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
 		cp "${output_file}" "${backup_file}"
 		log_info "已备份所有文件: ${backup_file}"
 	fi
