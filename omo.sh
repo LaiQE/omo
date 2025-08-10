@@ -47,9 +47,9 @@
 
 set -euo pipefail # 启用严格的错误处理
 
-#==============================================================================
-# 全局配置和变量定义
-#==============================================================================
+#=============================================
+# 1. 全局配置和变量定义 (Global Configuration)
+#=============================================
 SCRIPT_DIR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 readonly SCRIPT_DIR
@@ -69,26 +69,116 @@ readonly DOCKER_IMAGE_OLLAMA="ollama/ollama:latest"
 # 运行时配置
 VERBOSE="false" # 详细模式开关
 
-#==============================================================================
-# 工具函数
-#==============================================================================
-
 # 颜色定义
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
 readonly BLUE='\033[0;34m'
 readonly NC='\033[0m' # No Color
-#==============================================================================
-# 日志系统模块
-#==============================================================================
-# 日志规则:
-# 1. 主流程函数: 使用标准日志函数(log_info, log_success, log_warning, log_error)
-#    - 在普通模式和verbose模式下都显示, 用于用户关心的核心操作进度
-# 2. 工具函数: 正常追踪日志使用verbose版本(log_verbose, log_verbose_success)
-#    - 仅在verbose模式显示, 警告和错误(log_warning, log_error)在任何模式都显示
-# 3. 避免日志重复: 工具函数的追踪信息只在verbose模式显示, 主流程保持简洁
-#==============================================================================
+
+#=============================================
+# 2. 基础工具函数模块 (Basic Utilities)
+#=============================================
+
+get_host_timezone() {
+	# 尝试多种方法获取主机时区
+	if command_exists timedatectl; then
+		# 优先使用 timedatectl（systemd 系统）
+		timedatectl show --property=Timezone --value 2>/dev/null
+	elif [[ -L /etc/localtime ]]; then
+		# 通过符号链接获取时区
+		readlink /etc/localtime | sed 's|.*/zoneinfo/||'
+	elif [[ -f /etc/timezone ]]; then
+		# 从 /etc/timezone 文件读取
+		cat /etc/timezone
+	else
+		# 默认回退到 UTC
+		echo "UTC"
+	fi
+}
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+# 模型名称安全化处理
+# 统一的模型名称转换函数
+# 参数1: 模型名称
+# 参数2: 转换类型 (backup|ollama|filesystem)
+get_safe_model_name() {
+	local model_spec="$1"
+	local conversion_type="${2:-backup}"
+
+	case "${conversion_type}" in
+	"backup")
+		# 用于备份目录命名：/ 和 : → _
+		echo "${model_spec}" | sed 's/[\/:]/_/g'
+		;;
+	"ollama")
+		# 用于Ollama模型命名：复杂转换规则（一次性处理）
+		local full_name_clean
+		full_name_clean=$(echo "${model_spec}" | tr '[:upper:]' '[:lower:]' | sed -e 's/\//_/g' -e 's/[^a-z0-9_-]/_/g' -e 's/__*/_/g' -e 's/--*/-/g' -e 's/^[-_]\+\|[-_]\+$//g')
+		# 长度限制
+		if [[ ${#full_name_clean} -gt 50 ]]; then
+			local prefix="${full_name_clean:0:30}"
+			local suffix="${full_name_clean: -15}"
+			full_name_clean="${prefix}_${suffix}"
+		fi
+		echo "${full_name_clean}"
+		;;
+	"filesystem")
+		# 用于文件系统安全命名：/ → _，其他非法字符 → -
+		echo "${model_spec}" | sed -e 's/\//_/g' -e 's/[^a-zA-Z0-9._-]/-/g'
+		;;
+	*)
+		# 默认使用backup规则
+		echo "${model_spec}" | sed 's/[\/:]/_/g'
+		;;
+	esac
+}
+
+# 文件大小工具函数
+format_bytes() {
+	local bytes="$1"
+
+	# 使用单次awk调用减少开销，预定义常量提高可读性
+	awk -v b="${bytes}" '
+    BEGIN {
+        if (b >= 1073741824) printf "%.1fGB", b / 1073741824
+        else if (b >= 1048576) printf "%.1fMB", b / 1048576
+        else printf "%.1fKB", b / 1024
+    }'
+}
+
+# 等待Ollama容器就绪
+parse_model_spec() {
+	local model_spec="$1"
+	local -n name_var="$2"
+	local -n version_var="$3"
+
+	if ! validate_model_format "${model_spec}"; then
+		return 1
+	fi
+
+	name_var="${model_spec%:*}"
+	version_var="${model_spec#*:}"
+	return 0
+}
+
+# 初始化绝对路径
+create_temp_file() {
+	local prefix="${1:-temp}"
+	local temp_file
+	temp_file=$(mktemp) || {
+		log_error "Unable to create temporary file"
+		return 1
+	}
+	echo "${temp_file}"
+}
+
+#=============================================
+# 3. 日志系统模块 (Logging System)
+#=============================================
 
 log_info() {
 	printf "${BLUE}[INFO]${NC} %s\n" "$1"
@@ -107,6 +197,7 @@ log_error() {
 }
 
 # Verbose-only logging functions
+
 log_verbose() {
 	if [[ ${VERBOSE} == "true" ]]; then
 		printf "${BLUE}[INFO]${NC} %s\n" "$1"
@@ -125,16 +216,137 @@ log_verbose_warning() {
 }
 
 # 显示容器日志的工具函数
+
 show_container_logs() {
 	local container_name="$1"
 	log_error "Container logs:"
 	docker logs "${container_name}" 2>&1 | tail -10
 }
 
-#==============================================================================
-# 文件、路径相关工具函数
-#==============================================================================
-# 获取模型备份路径
+#=============================================
+# 4. 文件系统操作模块 (File System Operations)
+#=============================================
+
+get_file_size() {
+	local file_path="$1"
+	local format="${2:-mb}" # mb, human
+
+	case "${format}" in
+	"mb")
+		du -sm "${file_path}" 2>/dev/null | cut -f1
+		;;
+	"human")
+		du -sh "${file_path}" 2>/dev/null | cut -f1
+		;;
+	*)
+		log_error "Unknown format: ${format}. Use 'mb' or 'human'"
+		return 1
+		;;
+	esac
+}
+
+# 向后兼容的包装函数
+
+get_file_size_mb() {
+	get_file_size "$1" "mb"
+}
+
+get_file_size_human() {
+	get_file_size "$1" "human"
+}
+
+# 计算目录的MD5校验值
+
+calculate_directory_md5() {
+	local dir_path="$1"
+	local md5_file="$2"
+
+	if [[ ! -d ${dir_path} ]]; then
+		log_error "Directory does not exist: ${dir_path}"
+		return 1
+	fi
+
+	log_verbose "Calculating directory MD5 checksum: ${dir_path}"
+
+	# 使用find和md5sum计算所有文件的MD5值，使用相对路径
+	# 按文件路径排序以确保结果一致性
+	if (cd "${dir_path}" && find . -type f -print0 | sort -z | xargs -0 md5sum) >"${md5_file}" 2>/dev/null; then
+		log_verbose "MD5 checksum file generated: ${md5_file}"
+		return 0
+	else
+		log_error "Failed to calculate MD5 checksum"
+		return 1
+	fi
+}
+
+# 验证目录的MD5校验值
+
+verify_directory_md5() {
+	local dir_path="$1"
+	local md5_file="$2"
+
+	if [[ ! -d ${dir_path} ]]; then
+		log_error "Directory does not exist: ${dir_path}"
+		return 1
+	fi
+
+	if [[ ! -f ${md5_file} ]]; then
+		log_error "MD5 checksum file does not exist: ${md5_file}"
+		return 1
+	fi
+
+	log_verbose "Verifying directory MD5 checksum: ${dir_path}"
+
+	# 临时计算当前目录的MD5值
+	local temp_md5
+	temp_md5=$(mktemp)
+	if ! calculate_directory_md5 "${dir_path}" "${temp_md5}"; then
+		rm -f "${temp_md5}"
+		return 1
+	fi
+
+	# 比较MD5文件
+	if diff "${md5_file}" "${temp_md5}" >/dev/null 2>&1; then
+		log_verbose "MD5 checksum verified"
+		rm -f "${temp_md5}"
+		return 0
+	else
+		log_error "MD5 checksum verification failed"
+		rm -f "${temp_md5}"
+		return 1
+	fi
+}
+
+# 全局缓存变量
+declare -A BACKUP_CONTENT_CACHE
+declare -A MODEL_BLOB_CACHE
+
+docker_rm_rf() {
+	local target_path="$1"
+
+	# 安全检查：防止删除空路径或根目录
+	if [[ -z ${target_path} || ${target_path} == "/" ]]; then
+		log_error "Safe delete: path is empty or root directory, deletion refused"
+		return 1
+	fi
+
+	# 直接使用系统rm命令
+	rm -rf "${target_path}" 2>/dev/null
+}
+
+docker_mkdir_p() {
+	local target_path="$1"
+
+	# 直接使用系统mkdir命令
+	mkdir -p "${target_path}" 2>/dev/null
+}
+
+# 确保ollama/ollama镜像存在
+
+#=============================================
+# 5. 路径管理模块 (Path Management)
+#=============================================
+
 get_model_backup_path() {
 	local model_name="$1"
 	local model_tag="$2"
@@ -152,6 +364,289 @@ get_model_backup_path() {
 }
 
 # 解析manifest文件并获取所有blob引用
+
+get_model_manifest_path() {
+	local model_name="$1"
+	local model_version="$2"
+
+	if [[ ${model_name} == hf.co/* ]]; then
+		# HuggingFace GGUF模型，如 hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF
+		echo "${OLLAMA_MODELS_DIR}/manifests/${model_name}/${model_version}"
+	elif [[ ${model_name} == *"/"* ]]; then
+		# 用户分享的模型，如 lrs33/bce-embedding-base_v1
+		local user_name="${model_name%/*}"
+		local repo_name="${model_name#*/}"
+		echo "${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/${user_name}/${repo_name}/${model_version}"
+	else
+		# 官方模型
+		echo "${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_version}"
+	fi
+}
+
+# 获取主机时区
+
+init_paths() {
+	# 获取绝对路径，如果目录不存在则先创建父目录
+	mkdir -p "${OLLAMA_DATA_DIR}" || {
+		log_error "Unable to create necessary directories"
+		return 1
+	}
+
+	ABS_OLLAMA_DATA_DIR="$(realpath "${OLLAMA_DATA_DIR}")"
+
+}
+
+# Docker backup helper functions
+
+# Docker辅助函数 - 重命名分卷文件（从.000,.001,.002格式到.001,.002,.003格式）
+
+# Docker helper function - list tar content directly
+
+# 文件系统操作辅助函数
+
+create_model_backup_dir() {
+	local model_spec="$1"
+	local base_backup_dir="$2"
+	local model_safe_name
+	model_safe_name=$(get_safe_model_name "${model_spec}")
+	local model_backup_dir="${base_backup_dir}/${model_safe_name}"
+
+	# 创建备份目录
+	if ! mkdir -p "${model_backup_dir}"; then
+		log_error "Unable to create backup directory: ${model_backup_dir}"
+		return 1
+	fi
+	echo "${model_backup_dir}"
+}
+
+# 生成备份基础路径
+
+get_backup_base_path() {
+	local model_spec="$1"
+	local backup_dir="$2"
+	local suffix="${3-}"
+	local model_safe_name
+	model_safe_name=$(get_safe_model_name "${model_spec}")
+	echo "${backup_dir}/${model_safe_name}${suffix}"
+}
+
+# 备份信息和管理函数
+
+# 列出已安装的Ollama模型及详细信息
+
+#=============================================
+# 6. Docker与Ollama管理模块 (Docker & Ollama)
+#=============================================
+
+wait_for_ollama_ready() {
+	local container_name="$1"
+	local max_attempts=120 # 增加到120秒
+	local attempt=0
+
+	log_verbose "Waiting for Ollama service to start..."
+
+	while ((attempt < max_attempts)); do
+		# 首先检查容器是否还在运行
+		if ! docker ps -q --filter "name=^${container_name}$" | grep -q .; then
+			log_error "Container ${container_name} has stopped running"
+			show_container_logs "${container_name}"
+			return 1
+		fi
+
+		# 检查ollama服务是否就绪
+		if docker exec "${container_name}" ollama list &>/dev/null; then
+			log_verbose_success "Ollama service is ready"
+			return 0
+		fi
+
+		# 每10秒显示一次进度
+		if ((attempt % 10 == 0 && attempt > 0)); then
+			log_verbose "Waiting... (${attempt}/${max_attempts} seconds)"
+		fi
+
+		sleep 1
+		((attempt++))
+	done
+
+	log_error "Timeout waiting for Ollama service to be ready (${max_attempts} seconds)"
+	show_container_logs "${container_name}"
+	return 1
+}
+
+# Ollama模型列表缓存
+declare -g OLLAMA_MODELS_CACHE=""
+declare -g OLLAMA_CACHE_INITIALIZED="false"
+
+# 临时Ollama容器管理
+declare -g TEMP_OLLAMA_CONTAINER=""
+declare -g EXISTING_OLLAMA_CONTAINER=""
+
+# 全局清理函数管理
+declare -g GLOBAL_CLEANUP_FUNCTIONS=()
+declare -g GLOBAL_CLEANUP_INITIALIZED="false"
+
+# 全局清理函数管理
+
+ensure_ollama_image() {
+	if ! docker image inspect "${DOCKER_IMAGE_OLLAMA}" &>/dev/null; then
+		log_verbose "Pulling ${DOCKER_IMAGE_OLLAMA} image..."
+		if ! docker pull "${DOCKER_IMAGE_OLLAMA}"; then
+			log_error "${DOCKER_IMAGE_OLLAMA} image pull failed"
+			return 1
+		fi
+		log_verbose_success "${DOCKER_IMAGE_OLLAMA} image pull completed"
+	fi
+	return 0
+}
+
+# 查找运行中的Ollama容器
+
+find_running_ollama_container() {
+	# 检查是否有运行中的 Ollama 容器
+	local running_containers
+	running_containers=$(docker ps --format "{{.Names}}" --filter "ancestor=ollama/ollama")
+
+	if [[ -n ${running_containers} ]]; then
+		# 找到第一个运行中的容器
+		EXISTING_OLLAMA_CONTAINER=$(echo "${running_containers}" | head -n1)
+		log_verbose "Found running Ollama container: ${EXISTING_OLLAMA_CONTAINER}"
+		return 0
+	fi
+
+	# 检查本地11434端口是否有服务响应（可能是外部容器）
+	if command -v curl >/dev/null 2>&1; then
+		if curl -s --connect-timeout 2 http://localhost:11434/api/version >/dev/null 2>&1; then
+			# 找到使用11434端口的容器
+			local port_container
+			port_container=$(docker ps --format "{{.Names}}" --filter "publish=11434")
+			if [[ -n ${port_container} ]]; then
+				EXISTING_OLLAMA_CONTAINER=$(echo "${port_container}" | head -n1)
+				log_verbose "Found Ollama container using port 11434: ${EXISTING_OLLAMA_CONTAINER}"
+				return 0
+			fi
+		fi
+	fi
+
+	EXISTING_OLLAMA_CONTAINER=""
+	return 1
+}
+
+# 启动临时Ollama容器
+
+start_temp_ollama_container() {
+	if [[ -n ${TEMP_OLLAMA_CONTAINER} ]]; then
+		# 检查临时容器是否还在运行
+		if docker ps -q --filter "name=^${TEMP_OLLAMA_CONTAINER}$" | grep -q .; then
+			log_verbose "Temporary Ollama container still running: ${TEMP_OLLAMA_CONTAINER}"
+			return 0
+		else
+			log_verbose "Temporary Ollama container stopped, restarting"
+			TEMP_OLLAMA_CONTAINER=""
+		fi
+	fi
+
+	# 确保 Ollama 镜像存在
+	ensure_ollama_image || return 1
+
+	TEMP_OLLAMA_CONTAINER="ollama-temp-$$"
+
+	log_verbose "Starting temporary Ollama container: ${TEMP_OLLAMA_CONTAINER}"
+
+	# 构建容器启动命令
+	local cmd=("docker" "run" "-d" "--name" "${TEMP_OLLAMA_CONTAINER}")
+	cmd+=("--gpus" "all")
+	cmd+=("-v" "${ABS_OLLAMA_DATA_DIR}:/root/.ollama")
+	cmd+=("-p" "11435:11434") # 使用不同端口避免冲突
+	cmd+=("${DOCKER_IMAGE_OLLAMA}")
+
+	# 启动容器
+	local start_output
+	if start_output=$("${cmd[@]}" 2>&1); then
+		log_verbose "Temporary container started successfully, ID: ${start_output:0:12}"
+
+		# 等待服务就绪
+		if wait_for_ollama_ready "${TEMP_OLLAMA_CONTAINER}"; then
+			log_verbose_success "Temporary Ollama container ready: ${TEMP_OLLAMA_CONTAINER}"
+			# 设置清理陷阱
+			setup_temp_container_cleanup
+			return 0
+		else
+			log_error "Temporary Ollama container startup failed"
+			docker rm -f "${TEMP_OLLAMA_CONTAINER}" &>/dev/null
+			TEMP_OLLAMA_CONTAINER=""
+			return 1
+		fi
+	else
+		log_error "Unable to start temporary Ollama container"
+		log_error "Docker startup error: ${start_output}"
+		TEMP_OLLAMA_CONTAINER=""
+		return 1
+	fi
+}
+
+# 清理临时Ollama容器
+
+execute_ollama_command() {
+	local action="$1"
+	shift
+	local args=("$@")
+
+	log_verbose "Executing Ollama command: ${action} ${args[*]}"
+
+	# 首先查找运行中的Ollama容器
+	if find_running_ollama_container; then
+		log_verbose "Using existing Ollama container: ${EXISTING_OLLAMA_CONTAINER}"
+		log_verbose "Executing command: docker exec ${EXISTING_OLLAMA_CONTAINER} ollama ${action} ${args[*]}"
+		if docker exec "${EXISTING_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}"; then
+			return 0
+		else
+			log_error "Failed to execute Ollama command in existing container: ${action} ${args[*]}"
+			return 1
+		fi
+	else
+		# 没有找到运行中的容器，启动临时容器
+		log_verbose "No running Ollama container found, starting a temporary container"
+		if start_temp_ollama_container; then
+			log_verbose "Executing command in temporary container: docker exec ${TEMP_OLLAMA_CONTAINER} ollama ${action} ${args[*]}"
+			if docker exec "${TEMP_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}"; then
+				return 0
+			else
+				log_error "Failed to execute Ollama command in temporary container: ${action} ${args[*]}"
+				return 1
+			fi
+		else
+			log_error "Unable to start temporary Ollama container"
+			return 1
+		fi
+	fi
+}
+
+# 执行Ollama命令并获取输出
+
+execute_ollama_command_with_output() {
+	local action="$1"
+	shift
+	local args=("$@")
+
+	# 首先查找运行中的Ollama容器
+	if find_running_ollama_container; then
+		docker exec "${EXISTING_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}" 2>/dev/null
+	else
+		# 没有找到运行中的容器，启动临时容器
+		if start_temp_ollama_container; then
+			docker exec "${TEMP_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}" 2>/dev/null
+		else
+			return 1
+		fi
+	fi
+}
+
+# 显示使用帮助
+
+#=============================================
+# 7. 模型元数据与解析模块 (Model Metadata)
+#=============================================
+
 parse_manifest_blob_references() {
 	local backup_dir="$1"
 	local total_blobs_var="$2"  # 总共有几个blob
@@ -202,73 +697,7 @@ parse_manifest_blob_references() {
 }
 
 # 获取模型manifest文件路径的统一函数
-get_model_manifest_path() {
-	local model_name="$1"
-	local model_version="$2"
 
-	if [[ ${model_name} == hf.co/* ]]; then
-		# HuggingFace GGUF模型，如 hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF
-		echo "${OLLAMA_MODELS_DIR}/manifests/${model_name}/${model_version}"
-	elif [[ ${model_name} == *"/"* ]]; then
-		# 用户分享的模型，如 lrs33/bce-embedding-base_v1
-		local user_name="${model_name%/*}"
-		local repo_name="${model_name#*/}"
-		echo "${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/${user_name}/${repo_name}/${model_version}"
-	else
-		# 官方模型
-		echo "${OLLAMA_MODELS_DIR}/manifests/registry.ollama.ai/library/${model_name}/${model_version}"
-	fi
-}
-
-#==============================================================================
-# 其他工具函数
-#==============================================================================
-
-# 获取主机时区
-get_host_timezone() {
-	# 尝试多种方法获取主机时区
-	if command_exists timedatectl; then
-		# 优先使用 timedatectl（systemd 系统）
-		timedatectl show --property=Timezone --value 2>/dev/null
-	elif [[ -L /etc/localtime ]]; then
-		# 通过符号链接获取时区
-		readlink /etc/localtime | sed 's|.*/zoneinfo/||'
-	elif [[ -f /etc/timezone ]]; then
-		# 从 /etc/timezone 文件读取
-		cat /etc/timezone
-	else
-		# 默认回退到 UTC
-		echo "UTC"
-	fi
-}
-
-#==============================================================================
-# 任务执行模块
-#==============================================================================
-# 统一的任务执行函数
-execute_task() {
-	local task_name="$1"
-	local task_function="$2"
-	shift 2
-	local task_args=("$@")
-
-	log_info "Executing ${task_name}..."
-	if "${task_function}" "${task_args[@]}"; then
-		log_success "${task_name} completed"
-		exit 0
-	else
-		local exit_code=$?
-		if [[ ${exit_code} -eq 2 ]]; then
-			# 用户取消操作，不显示错误信息
-			exit 0
-		else
-			log_error "${task_name} failed"
-			exit 1
-		fi
-	fi
-}
-
-# 模型处理器 - 解析模型条目并返回处理函数
 parse_model_entry() {
 	local model_entry="$1"
 	local -n result_ref="$2"
@@ -300,189 +729,298 @@ parse_model_entry() {
 	return 0
 }
 
-#==============================================================================
-# 模型下载模块
-#==============================================================================
-
 # 下载模型
-download_model() {
-	local -n model_info_ref=$1
 
-	case "${model_info_ref[type]}" in
-	"ollama" | "hf-gguf")
-		download_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
-	*)
-		log_error "Unsupported model type: ${model_info_ref[type]}"
+parse_models_list() {
+	local models_file="$1"
+	local -n models_array=${2:-models}
+
+	if [[ ! -f ${models_file} ]]; then
+		log_error "Model list file does not exist: ${models_file}"
 		return 1
-		;;
-	esac
+	fi
+
+	log_verbose "Parsing model list file: ${models_file}"
+
+	while IFS= read -r line || [[ -n ${line} ]]; do
+		# 跳过空行和注释行
+		[[ -z ${line} || ${line} =~ ^[[:space:]]*# ]] && continue
+
+		# 使用空格分隔解析模型信息: 模型类型 模型名称 [量化类型]
+		read -r model_type model_name quantization <<<"${line}"
+
+		if [[ -n ${model_type} && -n ${model_name} ]]; then
+			if [[ ${model_type} == "ollama" || ${model_type} == "hf-gguf" ]]; then
+				# 如果有量化类型，添加到模型信息中
+				if [[ -n ${quantization} ]]; then
+					models_array+=("${model_type}:${model_name}:${quantization}")
+					log_verbose "Added model: ${model_type} -> ${model_name}:${quantization}"
+				else
+					models_array+=("${model_type}:${model_name}")
+					log_verbose "Added model: ${model_type} -> ${model_name}"
+				fi
+			else
+				log_warning "Unknown model type: ${model_type} (line: ${line})"
+			fi
+		else
+			log_warning "Ignoring invalid line: ${line}"
+		fi
+	done <"${models_file}"
+
+	# 检查是否找到有效模型
+	if [[ ${#models_array[@]} -eq 0 ]]; then
+		log_warning "================================ WARNING ================================"
+		log_warning "No valid models found in models.list file!"
+		log_warning "All model entries are either commented out or invalid."
+		log_warning ""
+		log_warning "Please edit the models.list file:"
+		log_warning "1. Uncomment (remove # at the beginning) the models you need"
+		log_warning "2. Add your own model configurations"
+		log_warning "3. Check model search URLs in the comments for available models"
+		log_warning ""
+		log_warning "Examples:"
+		log_warning "  ollama deepseek-r1:1.5b"
+		log_warning "  hf-gguf hf.co/MaziyarPanahi/gemma-3-1b-it-GGUF"
+		log_warning "====================================================================="
+		echo
+	else
+		log_verbose "Total models parsed: ${#models_array[@]}"
+	fi
 }
 
-# 下载Ollama模型
-download_ollama_model() {
+# 检查HuggingFace GGUF模型是否存在（通过Ollama检查）
+
+check_hf_gguf_model() {
 	local model_name="$1"
 	local model_tag="$2"
-
 	local full_model_name="${model_name}:${model_tag}"
 
-	log_info "Downloading: ${full_model_name}"
+	# 使用容器检查
+	if check_ollama_model_exists "${full_model_name}"; then
+		log_verbose_success "HuggingFace GGUF model already exists: ${full_model_name}"
+		return 0
+	fi
 
-	if execute_ollama_command "pull" "${full_model_name}"; then
-		log_verbose_success "Downloaded: ${full_model_name}"
+	log_verbose_warning "HuggingFace GGUF model does not exist: ${full_model_name}"
+	return 1
+}
 
-		# 验证下载后的模型完整性
-		if verify_model_after_installation "${model_name}" "${model_tag}"; then
-			log_verbose_success "Verified: ${full_model_name}"
-			return 0
-		else
-			log_error "Verification failed: ${full_model_name}"
-			return 1
-		fi
-	else
-		log_error "Download failed: ${full_model_name}"
+# 删除Ollama模型
+
+get_model_blob_paths() {
+	local manifest_file="$1"
+	local models_dir="$2"
+	local blob_paths=()
+
+	if [[ ! -f ${manifest_file} ]]; then
+		log_error "Model manifest file does not exist: ${manifest_file}"
 		return 1
 	fi
+
+	# 使用hf_downloader镜像中的jq解析JSON文件
+	local layers
+	layers=$(docker run --rm --entrypoint="" -v "$(dirname "${manifest_file}"):/data" hf_downloader jq -r '.layers[].digest, .config.digest' "/data/$(basename "${manifest_file}")" 2>/dev/null | sort -u)
+
+	# 构建blob文件路径
+	while IFS= read -r digest; do
+		if [[ -n ${digest} ]]; then
+			# 将 sha256:xxx 格式转换为 sha256-xxx
+			local blob_name="${digest//:/-}"
+			local blob_file="${models_dir}/blobs/${blob_name}"
+			blob_paths+=("${blob_file}")
+		fi
+	done <<<"${layers}"
+
+	# 输出路径
+	printf '%s\n' "${blob_paths[@]}"
 }
 
-# ===== 备份工具函数 =====
+# 检查备份完整性（检查备份中是否包含所有必需的blob文件）
 
-# 通用命令检查函数
-command_exists() {
-	command -v "$1" >/dev/null 2>&1
-}
+# 获取模型blob列表（带缓存）
 
-# 模型名称安全化处理
-# 统一的模型名称转换函数
-# 参数1: 模型名称
-# 参数2: 转换类型 (backup|ollama|filesystem)
-get_safe_model_name() {
+get_model_blobs_cached() {
 	local model_spec="$1"
-	local conversion_type="${2:-backup}"
 
-	case "${conversion_type}" in
-	"backup")
-		# 用于备份目录命名：/ 和 : → _
-		echo "${model_spec}" | sed 's/[\/:]/_/g'
-		;;
-	"ollama")
-		# 用于Ollama模型命名：复杂转换规则（一次性处理）
-		local full_name_clean
-		full_name_clean=$(echo "${model_spec}" | tr '[:upper:]' '[:lower:]' | sed -e 's/\//_/g' -e 's/[^a-z0-9_-]/_/g' -e 's/__*/_/g' -e 's/--*/-/g' -e 's/^[-_]\+\|[-_]\+$//g')
-		# 长度限制
-		if [[ ${#full_name_clean} -gt 50 ]]; then
-			local prefix="${full_name_clean:0:30}"
-			local suffix="${full_name_clean: -15}"
-			full_name_clean="${prefix}_${suffix}"
+	# 检查缓存
+	if [[ -n ${MODEL_BLOB_CACHE[${model_spec}]-} ]]; then
+		echo "${MODEL_BLOB_CACHE[${model_spec}]}"
+		return 0
+	fi
+
+	# 解析模型名称和版本
+	local model_name model_version
+	if ! parse_model_spec "${model_spec}" model_name model_version; then
+		return 1
+	fi
+
+	# 确定manifest文件路径
+	local manifest_file
+	manifest_file=$(get_model_manifest_path "${model_name}" "${model_version}")
+
+	# 获取blob文件列表
+	if [[ -f ${manifest_file} ]]; then
+		local blobs
+		blobs=$(get_model_blob_paths "${manifest_file}" "${OLLAMA_MODELS_DIR}" | sed "s|^${OLLAMA_MODELS_DIR}/||")
+		if [[ -n ${blobs} ]]; then
+			# 缓存结果
+			MODEL_BLOB_CACHE[${model_spec}]="${blobs}"
+			echo "${blobs}"
+			return 0
 		fi
-		echo "${full_name_clean}"
-		;;
-	"filesystem")
-		# 用于文件系统安全命名：/ → _，其他非法字符 → -
-		echo "${model_spec}" | sed -e 's/\//_/g' -e 's/[^a-zA-Z0-9._-]/-/g'
-		;;
-	*)
-		# 默认使用backup规则
-		echo "${model_spec}" | sed 's/[\/:]/_/g'
-		;;
-	esac
+	fi
+
+	return 1
 }
 
-# 文件大小工具函数
-get_file_size() {
-	local file_path="$1"
-	local format="${2:-mb}" # mb, human
+# 快速检查单文件备份完整性
 
-	case "${format}" in
-	"mb")
-		du -sm "${file_path}" 2>/dev/null | cut -f1
-		;;
-	"human")
-		du -sh "${file_path}" 2>/dev/null | cut -f1
-		;;
-	*)
-		log_error "Unknown format: ${format}. Use 'mb' or 'human'"
-		return 1
-		;;
-	esac
-}
+# 清理完整性检查缓存
 
-# 向后兼容的包装函数
-get_file_size_mb() {
-	get_file_size "$1" "mb"
-}
+#=============================================
+# 8. 缓存与清理管理模块 (Cache & Cleanup)
+#=============================================
 
-get_file_size_human() {
-	get_file_size "$1" "human"
-}
-
-# 计算目录的MD5校验值
-calculate_directory_md5() {
-	local dir_path="$1"
-	local md5_file="$2"
-
-	if [[ ! -d ${dir_path} ]]; then
-		log_error "Directory does not exist: ${dir_path}"
+add_cleanup_function() {
+	local func_name="$1"
+	if [[ -z ${func_name} ]]; then
+		log_error "Cleanup function name cannot be empty"
 		return 1
 	fi
 
-	log_verbose "Calculating directory MD5 checksum: ${dir_path}"
+	# 检查函数是否已存在，避免重复添加
+	local func
+	for func in "${GLOBAL_CLEANUP_FUNCTIONS[@]}"; do
+		if [[ ${func} == "${func_name}" ]]; then
+			return 0 # 已存在，直接返回
+		fi
+	done
 
-	# 使用find和md5sum计算所有文件的MD5值，使用相对路径
-	# 按文件路径排序以确保结果一致性
-	if (cd "${dir_path}" && find . -type f -print0 | sort -z | xargs -0 md5sum) >"${md5_file}" 2>/dev/null; then
-		log_verbose "MD5 checksum file generated: ${md5_file}"
+	GLOBAL_CLEANUP_FUNCTIONS+=("${func_name}")
+
+	# 如果是第一次添加，设置全局 trap
+	if [[ ${GLOBAL_CLEANUP_INITIALIZED} == "false" ]]; then
+		trap 'execute_global_cleanup' EXIT INT TERM
+		GLOBAL_CLEANUP_INITIALIZED="true"
+		log_verbose "Initializing global cleanup mechanism"
+	fi
+}
+
+# 执行所有清理函数
+
+execute_global_cleanup() {
+	local exit_code=$?
+	local func
+
+	# 如果是中断信号，显示中断消息
+	if [[ ${exit_code} -eq 130 ]]; then # Ctrl+C
+		log_warning "Detected interrupt signal (Ctrl+C)"
+	elif [[ ${exit_code} -eq 143 ]]; then # SIGTERM
+		log_warning "Detected termination signal (SIGTERM)"
+	fi
+
+	for func in "${GLOBAL_CLEANUP_FUNCTIONS[@]}"; do
+		if declare -f "${func}" >/dev/null 2>&1; then
+			log_verbose "Executing cleanup function: ${func}"
+			"${func}"
+		fi
+	done
+
+	# 如果是中断，退出
+	if [[ ${exit_code} -eq 130 || ${exit_code} -eq 143 ]]; then
+		exit "${exit_code}"
+	fi
+}
+
+# 移除清理函数
+
+remove_cleanup_function() {
+	local func_name="$1"
+	local new_array=()
+	local func
+
+	for func in "${GLOBAL_CLEANUP_FUNCTIONS[@]}"; do
+		if [[ ${func} != "${func_name}" ]]; then
+			new_array+=("${func}")
+		fi
+	done
+
+	GLOBAL_CLEANUP_FUNCTIONS=("${new_array[@]}")
+}
+
+# 初始化Ollama模型列表缓存
+
+init_ollama_cache() {
+	if [[ ${OLLAMA_CACHE_INITIALIZED} == "true" ]]; then
 		return 0
+	fi
+
+	log_verbose "Initializing Ollama model list cache..."
+
+	# 使用统一的容器逻辑获取模型列表
+	log_verbose "Getting Ollama model list..."
+
+	# 获取模型列表并缓存
+	OLLAMA_MODELS_CACHE=$(execute_ollama_command_with_output "list" | awk 'NR>1 {print $1}' | sort)
+	if [[ -n ${OLLAMA_MODELS_CACHE} ]]; then
+		OLLAMA_CACHE_INITIALIZED="true"
+		log_verbose_success "Ollama model list cache initialization completed"
 	else
-		log_error "Failed to calculate MD5 checksum"
-		return 1
+		log_verbose "Ollama model list is empty"
+		OLLAMA_MODELS_CACHE=""
+		OLLAMA_CACHE_INITIALIZED="true"
+	fi
+
+	return 0
+}
+
+# 检查Ollama模型是否存在（使用缓存）
+
+cleanup_temp_ollama_container() {
+	if [[ -n ${TEMP_OLLAMA_CONTAINER} ]]; then
+		log_verbose "Cleaning up temporary Ollama container: ${TEMP_OLLAMA_CONTAINER}"
+		docker rm -f "${TEMP_OLLAMA_CONTAINER}" &>/dev/null
+		TEMP_OLLAMA_CONTAINER=""
 	fi
 }
 
-# 验证目录的MD5校验值
-verify_directory_md5() {
-	local dir_path="$1"
-	local md5_file="$2"
+# 设置临时容器清理陷阱
 
-	if [[ ! -d ${dir_path} ]]; then
-		log_error "Directory does not exist: ${dir_path}"
-		return 1
-	fi
+setup_temp_container_cleanup() {
+	add_cleanup_function "cleanup_temp_ollama_container"
+}
 
-	if [[ ! -f ${md5_file} ]]; then
-		log_error "MD5 checksum file does not exist: ${md5_file}"
-		return 1
-	fi
+# 统一的Ollama命令执行函数
 
-	log_verbose "Verifying directory MD5 checksum: ${dir_path}"
+clear_integrity_cache() {
+	[[ -n ${VERBOSE} ]] && log_verbose "Clearing integrity check cache"
+	unset BACKUP_CONTENT_CACHE
+	unset MODEL_BLOB_CACHE
+	declare -g -A BACKUP_CONTENT_CACHE
+	declare -g -A MODEL_BLOB_CACHE
+}
 
-	# 临时计算当前目录的MD5值
-	local temp_md5
-	temp_md5=$(mktemp)
-	if ! calculate_directory_md5 "${dir_path}" "${temp_md5}"; then
-		rm -f "${temp_md5}"
-		return 1
-	fi
+# 确保完整性检查缓存已初始化
 
-	# 比较MD5文件
-	if diff "${md5_file}" "${temp_md5}" >/dev/null 2>&1; then
-		log_verbose "MD5 checksum verified"
-		rm -f "${temp_md5}"
-		return 0
-	else
-		log_error "MD5 checksum verification failed"
-		rm -f "${temp_md5}"
-		return 1
+ensure_cache_initialized() {
+	# Initialize cache arrays if they do not exist
+	if [[ ! -v BACKUP_CONTENT_CACHE ]] || [[ ! -v MODEL_BLOB_CACHE ]]; then
+		declare -g -A BACKUP_CONTENT_CACHE
+		declare -g -A MODEL_BLOB_CACHE
+		[[ -n ${VERBOSE} ]] && log_verbose "Integrity check cache initialized"
 	fi
 }
 
-# 全局缓存变量
-declare -A BACKUP_CONTENT_CACHE
-declare -A MODEL_BLOB_CACHE
-#==============================================================================
-# 检查验证模块 (Model Validation Module)
-#==============================================================================
-# 检查模型是否存在
+# ==================================================================================
+#                           统一完整性验证架构
+# ==================================================================================
+
+# 通用完整性验证函数 - 统一所有验证逻辑的入口点
+
+#=============================================
+# 9. 模型验证模块 (Model Validation)
+#=============================================
+
 check_model_exists() {
 	local -n model_info_ref=$1
 
@@ -499,6 +1037,7 @@ check_model_exists() {
 	esac
 }
 # 验证模型格式是否正确
+
 validate_model_format() {
 	local model_spec="$1"
 	if [[ ${model_spec} != *":"* ]]; then
@@ -509,6 +1048,7 @@ validate_model_format() {
 }
 
 # 验证Ollama模型完整性
+
 validate_ollama_model_integrity() {
 	local model_dir="$1"  # 模型目录（可以是备份目录或Ollama模型目录）
 	local model_spec="$2" # 可选的模型规格，用于直接检查安装的模型
@@ -580,6 +1120,7 @@ validate_ollama_model_integrity() {
 }
 
 # 验证模型安装后的完整性
+
 verify_model_after_installation() {
 	local model_name="$1"
 	local model_tag="$2"
@@ -605,9 +1146,222 @@ verify_model_after_installation() {
 	fi
 }
 
-#==============================================================================
-# 模型备份模块 (Model Backup Module)
-#==============================================================================
+verify_integrity() {
+	local verification_type="$1" # model, backup, hf_model
+	local target="$2"            # 目标文件/路径/模型规格
+	local options="${3-}"        # 附加选项 (use_cache:true, check_blobs:true, etc.)
+
+	# 解析选项
+	local use_cache="true"
+	local check_blobs="true"
+	local model_spec=""
+
+	# 解析选项字符串
+	if [[ -n ${options} ]]; then
+		while IFS=',' read -ra ADDR; do
+			for i in "${ADDR[@]}"; do
+				case "${i}" in
+				use_cache:*)
+					use_cache="${i#*:}"
+					;;
+				check_blobs:*)
+					check_blobs="${i#*:}"
+					;;
+				model_spec:*)
+					model_spec="${i#*:}"
+					;;
+				*)
+					# 忽略未知选项
+					;;
+				esac
+			done
+		done <<<"${options}"
+	fi
+
+	# 确保缓存已初始化
+	[[ ${use_cache} == "true" ]] && ensure_cache_initialized
+
+	# 根据验证类型调用相应的验证逻辑
+	case "${verification_type}" in
+	"model")
+		_verify_local_model "${target}" "${use_cache}" "${check_blobs}"
+		;;
+	"backup")
+		_verify_backup_target "${target}" "${model_spec}" "${use_cache}" "${check_blobs}"
+		;;
+	"backup_file")
+		_verify_backup_file "${target}" "${use_cache}"
+		;;
+	*)
+		log_error "Unknown verification type: ${verification_type}"
+		return 1
+		;;
+	esac
+}
+
+# 内部函数：验证本地模型完整性
+
+_verify_local_model() {
+	local model_spec="$1"
+	local use_cache="$2"
+	local check_blobs="$3"
+
+	# 解析模型规格
+	local model_name model_tag
+	if [[ ${model_spec} =~ ^(.+):(.+)$ ]]; then
+		model_name="${BASH_REMATCH[1]}"
+		model_tag="${BASH_REMATCH[2]}"
+	else
+		log_error "Invalid model spec format: ${model_spec}"
+		return 1
+	fi
+
+	# 确定manifest文件路径
+	local manifest_file
+	manifest_file=$(get_model_manifest_path "${model_name}" "${model_tag}")
+
+	# 检查manifest文件是否存在
+	[[ ! -f ${manifest_file} ]] && return 1
+
+	# 如果不需要检查blob，只验证manifest存在即可
+	[[ ${check_blobs} == "false" ]] && return 0
+
+	# 获取blob文件列表并验证
+	local blob_files
+	if [[ ${use_cache} == "true" ]]; then
+		blob_files=$(get_model_blobs_cached "${model_spec}")
+		[[ -z ${blob_files} ]] && return 1
+
+		# 检查每个blob文件
+		while IFS= read -r blob_relative_path; do
+			[[ -n ${blob_relative_path} && ! -f "${OLLAMA_MODELS_DIR}/${blob_relative_path}" ]] && return 1
+		done <<<"${blob_files}"
+	else
+		blob_files=$(get_model_blob_paths "${manifest_file}" "${OLLAMA_MODELS_DIR}")
+		[[ -z ${blob_files} ]] && return 1
+
+		# 检查每个blob文件
+		while IFS= read -r blob_file; do
+			[[ -n ${blob_file} && ! -f ${blob_file} ]] && return 1
+		done <<<"${blob_files}"
+	fi
+
+	return 0
+}
+
+# 内部函数：验证备份目标（目录备份）
+
+_verify_backup_target() {
+	local backup_target="$1"
+	local model_spec="$2"
+	local use_cache="$3"
+	local check_blobs="$4"
+
+	# 检查目录备份
+	if [[ -d ${backup_target} ]]; then
+		# Verify directory structure
+		if [[ -d "${backup_target}/manifests" ]] && [[ -d "${backup_target}/blobs" ]]; then
+			# Verify MD5 checksum
+			local md5_file="${backup_target}.md5"
+			if [[ -f ${md5_file} ]]; then
+				if verify_directory_md5 "${backup_target}" "${md5_file}"; then
+					[[ -n ${VERBOSE} ]] && log_info "Directory backup MD5 checksum verified: ${backup_target}"
+					return 0
+				else
+					log_error "Directory backup MD5 checksum failed: ${backup_target}"
+					return 1
+				fi
+			else
+				log_warning "MD5 checksum file not found: ${md5_file}"
+				return 0 # No MD5 file is still considered valid, but a warning is logged
+			fi
+		else
+			log_error "Invalid directory backup structure: ${backup_target}"
+			return 1
+		fi
+	fi
+
+	return 1
+}
+
+# 内部函数：验证模型文件完整性
+
+# 内部函数：验证备份文件（业务逻辑完整性）
+
+_verify_backup_file() {
+	local backup_dir="$1"
+	local use_detailed_check="$2"
+
+	[[ ! -d ${backup_dir} ]] && return 1
+
+	# 基本目录结构检查
+	if [[ ! -d ${backup_dir}/manifests ]] || [[ ! -d ${backup_dir}/blobs ]]; then
+		return 1
+	fi
+
+	# 检查是否有manifest文件
+	if ! find "${backup_dir}/manifests" -type f -name "*" | head -1 | read -r; then
+		return 1
+	fi
+
+	# 如果需要详细检查，执行业务逻辑验证
+	[[ ${use_detailed_check} == "true" ]] && validate_ollama_model_integrity "${backup_dir}"
+}
+
+# 删除不完整的备份文件
+
+#=============================================
+# 10. 模型下载模块 (Model Download)
+#=============================================
+
+download_model() {
+	local -n model_info_ref=$1
+
+	case "${model_info_ref[type]}" in
+	"ollama" | "hf-gguf")
+		download_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
+		;;
+	*)
+		log_error "Unsupported model type: ${model_info_ref[type]}"
+		return 1
+		;;
+	esac
+}
+
+# 下载Ollama模型
+
+download_ollama_model() {
+	local model_name="$1"
+	local model_tag="$2"
+
+	local full_model_name="${model_name}:${model_tag}"
+
+	log_info "Downloading: ${full_model_name}"
+
+	if execute_ollama_command "pull" "${full_model_name}"; then
+		log_verbose_success "Downloaded: ${full_model_name}"
+
+		# 验证下载后的模型完整性
+		if verify_model_after_installation "${model_name}" "${model_tag}"; then
+			log_verbose_success "Verified: ${full_model_name}"
+			return 0
+		else
+			log_error "Verification failed: ${full_model_name}"
+			return 1
+		fi
+	else
+		log_error "Download failed: ${full_model_name}"
+		return 1
+	fi
+}
+
+# ===== 备份工具函数 =====
+
+# 通用命令检查函数
+
+#=============================================
+# 11. 模型备份模块 (Model Backup)
+#=============================================
 
 backup_ollama_model() {
 	local model_name="$1"
@@ -711,6 +1465,7 @@ backup_ollama_model() {
 	return 0
 }
 # 备份单个模型的包装函数
+
 backup_single_model() {
 	local -n model_info_ref=$1
 
@@ -727,6 +1482,7 @@ backup_single_model() {
 
 # 自动识别备份类型并恢复
 # 批量备份模型（根据models.list文件）
+
 backup_models_from_list() {
 	local models_file="$1"
 
@@ -848,1231 +1604,8 @@ backup_models_from_list() {
 		return 1
 	fi
 }
-
-#==============================================================================
-# 模型恢复模块 (Model Restore Module)
-#==============================================================================
-
-# 恢复模型的统一入口函数（从文件路径恢复）
-restore_model() {
-	local restore_file="$1"
-	local force_restore="${2:-false}"
-
-	# 处理路径解析
-	local restore_path="${restore_file}"
-	if [[ ${restore_file} != /* ]]; then
-		restore_path="${BACKUP_OUTPUT_DIR}/${restore_file}"
-	fi
-
-	# 检查路径是否存在
-	if [[ ! -d ${restore_path} ]]; then
-		log_error "Backup directory does not exist: ${restore_path}"
-		return 1
-	fi
-
-	# 分发到具体的恢复实现
-	_restore_by_type "ollama" "${restore_path}" "${force_restore}"
-}
-
-# 尝试从备份自动恢复模型（从模型信息恢复）
-try_restore_model() {
-	local -n model_info_ref=$1
-
-	case "${model_info_ref[type]}" in
-	"ollama" | "hf-gguf")
-		_auto_restore_from_backup "${model_info_ref[type]}" "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
-	*)
-		log_error "Unsupported model type for restore: ${model_info_ref[type]}"
-		return 1
-		;;
-	esac
-}
-
-# 内部函数：自动恢复实现
-_auto_restore_from_backup() {
-	local model_type="$1"
-	local model_name="$2"
-	local model_tag="$3"
-	local model_spec="${model_name}:${model_tag}"
-
-	log_verbose "Checking for model backup: ${model_spec}"
-
-	# 获取备份路径
-	local backup_model_dir
-	backup_model_dir=$(get_model_backup_path "${model_name}" "${model_tag}")
-
-	# 检查备份是否存在
-	if [[ ! -d ${backup_model_dir} ]]; then
-		log_verbose "No backup found: ${backup_model_dir}"
-		return 1
-	fi
-
-	log_verbose_success "Found model backup: ${backup_model_dir}"
-	log_verbose "Restoring model from backup..."
-
-	# 调用统一的恢复实现
-	if _restore_by_type "${model_type}" "${backup_model_dir}" "true"; then
-		log_success "Successfully restored model from backup: ${model_spec}"
-		return 0
-	else
-		log_warning "Failed to restore model from backup"
-		return 1
-	fi
-}
-
-# 内部函数：按类型分发恢复（统一接口）
-_restore_by_type() {
-	local model_type="$1"
-	local backup_path="$2"
-	local force_restore="${3:-false}"
-
-	case "${model_type}" in
-	"ollama" | "hf-gguf")
-		_restore_ollama_implementation "${backup_path}" "${force_restore}"
-		;;
-	*)
-		log_error "Unsupported model type for restore: ${model_type}"
-		return 1
-		;;
-	esac
-}
-
-# 内部函数：Ollama模型恢复的核心实现
-_restore_ollama_implementation() {
-	local backup_dir="$1"
-	local force_restore="${2:-false}"
-
-	log_info "Restoring model: $(basename "${backup_dir}")"
-
-	# 验证备份结构
-	if ! _validate_backup_structure "${backup_dir}"; then
-		return 1
-	fi
-
-	# 执行完整性校验
-	if ! _verify_backup_integrity "${backup_dir}" "${force_restore}"; then
-		return 1
-	fi
-
-	# 检查文件冲突
-	if ! _check_restore_conflicts "${backup_dir}" "${force_restore}"; then
-		return 1
-	fi
-
-	# 执行文件恢复
-	if ! _perform_files_restore "${backup_dir}"; then
-		return 1
-	fi
-
-	log_verbose_success "Model restore completed"
-	return 0
-}
-
-# 内部函数：验证备份结构
-_validate_backup_structure() {
-	local backup_dir="$1"
-
-	if [[ ! -d ${backup_dir} ]]; then
-		log_error "Backup directory does not exist: ${backup_dir}"
-		return 1
-	fi
-
-	if [[ ! -d "${backup_dir}/manifests" ]] || [[ ! -d "${backup_dir}/blobs" ]]; then
-		log_error "Invalid backup structure: missing manifests or blobs directory"
-		return 1
-	fi
-
-	return 0
-}
-
-# 内部函数：验证备份完整性
-_verify_backup_integrity() {
-	local backup_dir="$1"
-	local force_restore="$2"
-
-	local md5_file="${backup_dir}.md5"
-	if [[ ! -f ${md5_file} ]]; then
-		log_warning "Skipping integrity check: MD5 file not found"
-		return 0
-	fi
-
-	log_info "Verifying backup integrity..."
-	if verify_directory_md5 "${backup_dir}" "${md5_file}"; then
-		log_verbose_success "MD5 verification passed"
-		return 0
-	else
-		log_error "Backup integrity check failed"
-		if [[ ${force_restore} == "true" ]]; then
-			log_warning "Force restore mode, continuing..."
-			return 0
-		else
-			return 1
-		fi
-	fi
-}
-
-# 内部函数：检查恢复冲突
-_check_restore_conflicts() {
-	local backup_dir="$1"
-	local force_restore="$2"
-
-	if [[ ${force_restore} == "true" ]]; then
-		return 0
-	fi
-
-	log_info "Checking for file conflicts..."
-	local conflicts_found=false
-
-	for backup_subdir in manifests blobs; do
-		if find "${backup_dir}/${backup_subdir}" -type f 2>/dev/null | while read -r backup_file; do
-			local rel_path="${backup_file#"${backup_dir}/${backup_subdir}"/}"
-			local target_file="${OLLAMA_MODELS_DIR}/${backup_subdir}/${rel_path}"
-			if [[ -f ${target_file} ]]; then
-				echo "conflict"
-				break
-			fi
-		done | grep -q "conflict"; then
-			conflicts_found=true
-			break
-		fi
-	done
-
-	if [[ ${conflicts_found} == "true" ]]; then
-		log_error "File conflicts detected, use --force to override"
-		return 1
-	fi
-
-	return 0
-}
-
-# 内部函数：执行文件恢复
-_perform_files_restore() {
-	local backup_dir="$1"
-
-	# 创建目标目录
-	if ! mkdir -p "${OLLAMA_MODELS_DIR}/manifests" "${OLLAMA_MODELS_DIR}/blobs"; then
-		log_error "Failed to create Ollama directories"
-		return 1
-	fi
-
-	# 恢复manifest文件
-	log_verbose "Restoring model manifests..."
-	if ! cp -r "${backup_dir}/manifests/"* "${OLLAMA_MODELS_DIR}/manifests/"; then
-		log_error "Failed to restore manifest files"
-		return 1
-	fi
-
-	# 恢复blob文件
-	log_verbose "Restoring model data..."
-	if ! cp "${backup_dir}/blobs/"* "${OLLAMA_MODELS_DIR}/blobs/"; then
-		log_error "Failed to restore blob files"
-		return 1
-	fi
-
-	return 0
-}
-
-# 格式化字节大小为人类可读格式
-format_bytes() {
-	local bytes="$1"
-
-	# 使用单次awk调用减少开销，预定义常量提高可读性
-	awk -v b="${bytes}" '
-    BEGIN {
-        if (b >= 1073741824) printf "%.1fGB", b / 1073741824
-        else if (b >= 1048576) printf "%.1fMB", b / 1048576  
-        else printf "%.1fKB", b / 1024
-    }'
-}
-
-# 等待Ollama容器就绪
-wait_for_ollama_ready() {
-	local container_name="$1"
-	local max_attempts=120 # 增加到120秒
-	local attempt=0
-
-	log_verbose "Waiting for Ollama service to start..."
-
-	while ((attempt < max_attempts)); do
-		# 首先检查容器是否还在运行
-		if ! docker ps -q --filter "name=^${container_name}$" | grep -q .; then
-			log_error "Container ${container_name} has stopped running"
-			show_container_logs "${container_name}"
-			return 1
-		fi
-
-		# 检查ollama服务是否就绪
-		if docker exec "${container_name}" ollama list &>/dev/null; then
-			log_verbose_success "Ollama service is ready"
-			return 0
-		fi
-
-		# 每10秒显示一次进度
-		if ((attempt % 10 == 0 && attempt > 0)); then
-			log_verbose "Waiting... (${attempt}/${max_attempts} seconds)"
-		fi
-
-		sleep 1
-		((attempt++))
-	done
-
-	log_error "Timeout waiting for Ollama service to be ready (${max_attempts} seconds)"
-	show_container_logs "${container_name}"
-	return 1
-}
-
-# Ollama模型列表缓存
-declare -g OLLAMA_MODELS_CACHE=""
-declare -g OLLAMA_CACHE_INITIALIZED="false"
-
-# 临时Ollama容器管理
-declare -g TEMP_OLLAMA_CONTAINER=""
-declare -g EXISTING_OLLAMA_CONTAINER=""
-
-# 全局清理函数管理
-declare -g GLOBAL_CLEANUP_FUNCTIONS=()
-declare -g GLOBAL_CLEANUP_INITIALIZED="false"
-
-# 全局清理函数管理
-add_cleanup_function() {
-	local func_name="$1"
-	if [[ -z ${func_name} ]]; then
-		log_error "Cleanup function name cannot be empty"
-		return 1
-	fi
-
-	# 检查函数是否已存在，避免重复添加
-	local func
-	for func in "${GLOBAL_CLEANUP_FUNCTIONS[@]}"; do
-		if [[ ${func} == "${func_name}" ]]; then
-			return 0 # 已存在，直接返回
-		fi
-	done
-
-	GLOBAL_CLEANUP_FUNCTIONS+=("${func_name}")
-
-	# 如果是第一次添加，设置全局 trap
-	if [[ ${GLOBAL_CLEANUP_INITIALIZED} == "false" ]]; then
-		trap 'execute_global_cleanup' EXIT INT TERM
-		GLOBAL_CLEANUP_INITIALIZED="true"
-		log_verbose "Initializing global cleanup mechanism"
-	fi
-}
-
-# 执行所有清理函数
-execute_global_cleanup() {
-	local exit_code=$?
-	local func
-
-	# 如果是中断信号，显示中断消息
-	if [[ ${exit_code} -eq 130 ]]; then # Ctrl+C
-		log_warning "Detected interrupt signal (Ctrl+C)"
-	elif [[ ${exit_code} -eq 143 ]]; then # SIGTERM
-		log_warning "Detected termination signal (SIGTERM)"
-	fi
-
-	for func in "${GLOBAL_CLEANUP_FUNCTIONS[@]}"; do
-		if declare -f "${func}" >/dev/null 2>&1; then
-			log_verbose "Executing cleanup function: ${func}"
-			"${func}"
-		fi
-	done
-
-	# 如果是中断，退出
-	if [[ ${exit_code} -eq 130 || ${exit_code} -eq 143 ]]; then
-		exit "${exit_code}"
-	fi
-}
-
-# 移除清理函数
-remove_cleanup_function() {
-	local func_name="$1"
-	local new_array=()
-	local func
-
-	for func in "${GLOBAL_CLEANUP_FUNCTIONS[@]}"; do
-		if [[ ${func} != "${func_name}" ]]; then
-			new_array+=("${func}")
-		fi
-	done
-
-	GLOBAL_CLEANUP_FUNCTIONS=("${new_array[@]}")
-}
-
-# 初始化Ollama模型列表缓存
-init_ollama_cache() {
-	if [[ ${OLLAMA_CACHE_INITIALIZED} == "true" ]]; then
-		return 0
-	fi
-
-	log_verbose "Initializing Ollama model list cache..."
-
-	# 使用统一的容器逻辑获取模型列表
-	log_verbose "Getting Ollama model list..."
-
-	# 获取模型列表并缓存
-	OLLAMA_MODELS_CACHE=$(execute_ollama_command_with_output "list" | awk 'NR>1 {print $1}' | sort)
-	if [[ -n ${OLLAMA_MODELS_CACHE} ]]; then
-		OLLAMA_CACHE_INITIALIZED="true"
-		log_verbose_success "Ollama model list cache initialization completed"
-	else
-		log_verbose "Ollama model list is empty"
-		OLLAMA_MODELS_CACHE=""
-		OLLAMA_CACHE_INITIALIZED="true"
-	fi
-
-	return 0
-}
-
-# 检查Ollama模型是否存在（使用缓存）
-check_ollama_model_exists() {
-	local model_name="$1"
-
-	# 确保缓存已初始化
-	if ! init_ollama_cache; then
-		log_error "Failed to initialize Ollama model cache"
-		return 1
-	fi
-
-	# 在缓存中查找模型
-	if echo "${OLLAMA_MODELS_CACHE}" | grep -q "^${model_name}$"; then
-		return 0
-	else
-		return 1
-	fi
-}
-
-# 清理不完整的模型
-cleanup_incomplete_model() {
-	local model_name="$1"
-	local model_tag="$2"
-	local full_model_name="${model_name}:${model_tag}"
-
-	log_verbose_warning "Detected incomplete model, cleaning up: ${full_model_name}"
-
-	# 确定manifest文件路径
-	local manifest_file
-	manifest_file=$(get_model_manifest_path "${model_name}" "${model_tag}")
-
-	# 删除manifest文件
-	if [[ -f ${manifest_file} ]]; then
-		if docker_rm_rf "${manifest_file}"; then
-			log_verbose "Deleted incomplete manifest file: ${manifest_file}"
-		else
-			log_warning "Unable to delete manifest file: ${manifest_file}"
-		fi
-	fi
-
-	# 清除缓存，强制重新检查
-	OLLAMA_CACHE_INITIALIZED="false"
-	OLLAMA_MODELS_CACHE=""
-
-	log_verbose_success "Incomplete model cleanup completed: ${full_model_name}"
-}
-
-# 简化的模型检查函数
-check_ollama_model() {
-	local model_name="$1"
-	local model_tag="$2"
-	local full_model_name="${model_name}:${model_tag}"
-
-	# 首先尝试通过Ollama容器检查（最准确）
-	if check_ollama_model_exists "${full_model_name}"; then
-		log_verbose_success "Ollama model already exists: ${full_model_name}"
-		return 0
-	fi
-
-	# 如果Ollama容器检查失败，进行完整性检查（使用缓存优化）
-	local model_spec="${model_name}:${model_tag}"
-	if verify_integrity "model" "${model_spec}" "use_cache:true,check_blobs:true"; then
-		log_verbose_success "Ollama model exists (filesystem verification): ${full_model_name}"
-		return 0
-	else
-		log_verbose_warning "Ollama model does not exist or is incomplete: ${full_model_name}"
-		return 1
-	fi
-}
-
-# 解析模型规格（model:version格式）
-# shellcheck disable=SC2034  # nameref variables are used by reference
-parse_model_spec() {
-	local model_spec="$1"
-	local -n name_var="$2"
-	local -n version_var="$3"
-
-	if ! validate_model_format "${model_spec}"; then
-		return 1
-	fi
-
-	name_var="${model_spec%:*}"
-	version_var="${model_spec#*:}"
-	return 0
-}
-
-# 初始化绝对路径
-init_paths() {
-	# 获取绝对路径，如果目录不存在则先创建父目录
-	mkdir -p "${OLLAMA_DATA_DIR}" || {
-		log_error "Unable to create necessary directories"
-		return 1
-	}
-
-	ABS_OLLAMA_DATA_DIR="$(realpath "${OLLAMA_DATA_DIR}")"
-
-}
-
-# Docker backup helper functions
-
-# Docker辅助函数 - 重命名分卷文件（从.000,.001,.002格式到.001,.002,.003格式）
-
-# Docker helper function - list tar content directly
-
-# 文件系统操作辅助函数
-docker_rm_rf() {
-	local target_path="$1"
-
-	# 安全检查：防止删除空路径或根目录
-	if [[ -z ${target_path} || ${target_path} == "/" ]]; then
-		log_error "Safe delete: path is empty or root directory, deletion refused"
-		return 1
-	fi
-
-	# 直接使用系统rm命令
-	rm -rf "${target_path}" 2>/dev/null
-}
-
-docker_mkdir_p() {
-	local target_path="$1"
-
-	# 直接使用系统mkdir命令
-	mkdir -p "${target_path}" 2>/dev/null
-}
-
-# 确保ollama/ollama镜像存在
-ensure_ollama_image() {
-	if ! docker image inspect "${DOCKER_IMAGE_OLLAMA}" &>/dev/null; then
-		log_verbose "Pulling ${DOCKER_IMAGE_OLLAMA} image..."
-		if ! docker pull "${DOCKER_IMAGE_OLLAMA}"; then
-			log_error "${DOCKER_IMAGE_OLLAMA} image pull failed"
-			return 1
-		fi
-		log_verbose_success "${DOCKER_IMAGE_OLLAMA} image pull completed"
-	fi
-	return 0
-}
-
-# 查找运行中的Ollama容器
-find_running_ollama_container() {
-	# 检查是否有运行中的 Ollama 容器
-	local running_containers
-	running_containers=$(docker ps --format "{{.Names}}" --filter "ancestor=ollama/ollama")
-
-	if [[ -n ${running_containers} ]]; then
-		# 找到第一个运行中的容器
-		EXISTING_OLLAMA_CONTAINER=$(echo "${running_containers}" | head -n1)
-		log_verbose "Found running Ollama container: ${EXISTING_OLLAMA_CONTAINER}"
-		return 0
-	fi
-
-	# 检查本地11434端口是否有服务响应（可能是外部容器）
-	if command -v curl >/dev/null 2>&1; then
-		if curl -s --connect-timeout 2 http://localhost:11434/api/version >/dev/null 2>&1; then
-			# 找到使用11434端口的容器
-			local port_container
-			port_container=$(docker ps --format "{{.Names}}" --filter "publish=11434")
-			if [[ -n ${port_container} ]]; then
-				EXISTING_OLLAMA_CONTAINER=$(echo "${port_container}" | head -n1)
-				log_verbose "Found Ollama container using port 11434: ${EXISTING_OLLAMA_CONTAINER}"
-				return 0
-			fi
-		fi
-	fi
-
-	EXISTING_OLLAMA_CONTAINER=""
-	return 1
-}
-
-# 启动临时Ollama容器
-start_temp_ollama_container() {
-	if [[ -n ${TEMP_OLLAMA_CONTAINER} ]]; then
-		# 检查临时容器是否还在运行
-		if docker ps -q --filter "name=^${TEMP_OLLAMA_CONTAINER}$" | grep -q .; then
-			log_verbose "Temporary Ollama container still running: ${TEMP_OLLAMA_CONTAINER}"
-			return 0
-		else
-			log_verbose "Temporary Ollama container stopped, restarting"
-			TEMP_OLLAMA_CONTAINER=""
-		fi
-	fi
-
-	# 确保 Ollama 镜像存在
-	ensure_ollama_image || return 1
-
-	TEMP_OLLAMA_CONTAINER="ollama-temp-$$"
-
-	log_verbose "Starting temporary Ollama container: ${TEMP_OLLAMA_CONTAINER}"
-
-	# 构建容器启动命令
-	local cmd=("docker" "run" "-d" "--name" "${TEMP_OLLAMA_CONTAINER}")
-	cmd+=("--gpus" "all")
-	cmd+=("-v" "${ABS_OLLAMA_DATA_DIR}:/root/.ollama")
-	cmd+=("-p" "11435:11434") # 使用不同端口避免冲突
-	cmd+=("${DOCKER_IMAGE_OLLAMA}")
-
-	# 启动容器
-	local start_output
-	if start_output=$("${cmd[@]}" 2>&1); then
-		log_verbose "Temporary container started successfully, ID: ${start_output:0:12}"
-
-		# 等待服务就绪
-		if wait_for_ollama_ready "${TEMP_OLLAMA_CONTAINER}"; then
-			log_verbose_success "Temporary Ollama container ready: ${TEMP_OLLAMA_CONTAINER}"
-			# 设置清理陷阱
-			setup_temp_container_cleanup
-			return 0
-		else
-			log_error "Temporary Ollama container startup failed"
-			docker rm -f "${TEMP_OLLAMA_CONTAINER}" &>/dev/null
-			TEMP_OLLAMA_CONTAINER=""
-			return 1
-		fi
-	else
-		log_error "Unable to start temporary Ollama container"
-		log_error "Docker startup error: ${start_output}"
-		TEMP_OLLAMA_CONTAINER=""
-		return 1
-	fi
-}
-
-# 清理临时Ollama容器
-cleanup_temp_ollama_container() {
-	if [[ -n ${TEMP_OLLAMA_CONTAINER} ]]; then
-		log_verbose "Cleaning up temporary Ollama container: ${TEMP_OLLAMA_CONTAINER}"
-		docker rm -f "${TEMP_OLLAMA_CONTAINER}" &>/dev/null
-		TEMP_OLLAMA_CONTAINER=""
-	fi
-}
-
-# 设置临时容器清理陷阱
-setup_temp_container_cleanup() {
-	add_cleanup_function "cleanup_temp_ollama_container"
-}
-
-# 统一的Ollama命令执行函数
-execute_ollama_command() {
-	local action="$1"
-	shift
-	local args=("$@")
-
-	log_verbose "Executing Ollama command: ${action} ${args[*]}"
-
-	# 首先查找运行中的Ollama容器
-	if find_running_ollama_container; then
-		log_verbose "Using existing Ollama container: ${EXISTING_OLLAMA_CONTAINER}"
-		log_verbose "Executing command: docker exec ${EXISTING_OLLAMA_CONTAINER} ollama ${action} ${args[*]}"
-		if docker exec "${EXISTING_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}"; then
-			return 0
-		else
-			log_error "Failed to execute Ollama command in existing container: ${action} ${args[*]}"
-			return 1
-		fi
-	else
-		# 没有找到运行中的容器，启动临时容器
-		log_verbose "No running Ollama container found, starting a temporary container"
-		if start_temp_ollama_container; then
-			log_verbose "Executing command in temporary container: docker exec ${TEMP_OLLAMA_CONTAINER} ollama ${action} ${args[*]}"
-			if docker exec "${TEMP_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}"; then
-				return 0
-			else
-				log_error "Failed to execute Ollama command in temporary container: ${action} ${args[*]}"
-				return 1
-			fi
-		else
-			log_error "Unable to start temporary Ollama container"
-			return 1
-		fi
-	fi
-}
-
-# 执行Ollama命令并获取输出
-execute_ollama_command_with_output() {
-	local action="$1"
-	shift
-	local args=("$@")
-
-	# 首先查找运行中的Ollama容器
-	if find_running_ollama_container; then
-		docker exec "${EXISTING_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}" 2>/dev/null
-	else
-		# 没有找到运行中的容器，启动临时容器
-		if start_temp_ollama_container; then
-			docker exec "${TEMP_OLLAMA_CONTAINER}" ollama "${action}" "${args[@]}" 2>/dev/null
-		else
-			return 1
-		fi
-	fi
-}
-
-# 显示使用帮助
-show_help() {
-	cat <<'EOF'
-🤖 OMO - Oh My Ollama / Ollama Models Organizer
-
-使用方法:
-  ./omo.sh [OPTIONS]
-
-选项:
-  --models-file FILE    指定模型列表文件 (默认: ./models.list)
-  --ollama-dir DIR      指定Ollama数据目录 (默认: ./ollama)
-  --backup-dir DIR      备份目录 (默认: ./backups)
-  --install             安装/下载模型 (覆盖默认的仅检查行为)
-  --check-only          仅检查模型状态，不下载 (默认行为)
-  --force-download      强制重新下载所有模型 (自动启用安装模式)
-  --verbose             显示详细日志
-  --list                列出已安装的Ollama模型及详细信息
-  --backup MODEL        备份指定模型 (格式: 模型名:版本)
-  --backup-all          备份所有模型
-  --restore FILE        恢复指定备份文件
-  --remove MODEL        删除指定模型
-  --remove-all          删除所有模型
-  --force               强制操作（跳过确认）
-  --generate-compose    生成docker-compose.yaml文件（基于models.list）
-  --help                显示帮助信息
-
-模型列表文件格式:
-  ollama deepseek-r1:1.5b
-  hf-gguf hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
-
-下载缓存:
-  HuggingFace GGUF模型下载支持断点续传和缓存复用
-  每个模型有独立的缓存子目录
-  中断后重新运行脚本将恢复下载，完成后自动缓存
-
-EOF
-	cat <<'EOF'
-
-Ollama模型备份:
-  支持完整的Ollama模型备份和恢复
-  备份目录: ./backups (默认，可通过--backup-dir指定)
-  备份格式: 目录复制 (模型名/)
-  包含内容: manifest文件和所有blob数据
-  自动生成: MD5校验文件和详细信息文件
-  
-备份特性:
-  - 直接复制备份，无压缩处理，备份和恢复速度极快
-  - MD5校验确保文件完整性
-  - 每个模型独立文件夹，便于管理
-
-示例:
-  # 检查模型状态 (默认行为)
-  ./omo.sh
-  
-  # 安装/下载缺失的模型
-  ./omo.sh --install
-  
-  # 仅检查状态 (同默认行为)
-  ./omo.sh --check-only
-  
-  # 列出已安装的模型
-  ./omo.sh --list
-  
-  # 备份模型
-  ./omo.sh --backup tinyllama:latest
-  
-  # 删除模型
-  ./omo.sh --remove llama2:7b --force
-
-EOF
-}
-
-# 检查依赖
-# 检查GPU支持
-check_gpu_support() {
-	# 检查是否支持NVIDIA GPU
-	if command_exists nvidia-smi && nvidia-smi &>/dev/null; then
-		return 0 # 支持GPU
-	fi
-	return 1 # 不支持GPU
-}
-
-check_dependencies() {
-	local missing_deps=()
-
-	# 检查 docker
-	if ! command_exists docker; then
-		missing_deps+=("docker")
-		log_error "Docker not installed or not in PATH"
-	else
-		# 检查 Docker 守护进程是否运行
-		if ! docker info &>/dev/null; then
-			log_error "Docker is installed but daemon is not running, please start Docker service"
-			return 1
-		fi
-	fi
-
-	# 检查 tar
-	if ! command_exists tar; then
-		missing_deps+=("tar")
-		log_error "tar not installed, required for model file packing/unpacking"
-	fi
-
-	# 如果有缺失的依赖，给出提示并退出
-	if [[ ${#missing_deps[@]} -gt 0 ]]; then
-		log_error "Missing required system dependencies: ${missing_deps[*]}"
-		log_error "Please install the missing dependencies and rerun the script"
-		return 1
-	fi
-
-	# 检查GPU支持（必需项）
-	if ! check_gpu_support; then
-		log_error "No NVIDIA GPU support detected. This script requires a GPU environment."
-		log_error "Please ensure: 1) NVIDIA drivers are installed  2) nvidia-smi tool is installed"
-		return 1
-	fi
-
-	log_verbose "NVIDIA GPU support detected, GPU acceleration will be enabled"
-
-	# 所有依赖检查通过，静默返回
-	return 0
-}
-
-# 解析模型列表文件
-parse_models_list() {
-	local models_file="$1"
-	local -n models_array=${2:-models}
-
-	if [[ ! -f ${models_file} ]]; then
-		log_error "Model list file does not exist: ${models_file}"
-		return 1
-	fi
-
-	log_verbose "Parsing model list file: ${models_file}"
-
-	while IFS= read -r line || [[ -n ${line} ]]; do
-		# 跳过空行和注释行
-		[[ -z ${line} || ${line} =~ ^[[:space:]]*# ]] && continue
-
-		# 使用空格分隔解析模型信息: 模型类型 模型名称 [量化类型]
-		read -r model_type model_name quantization <<<"${line}"
-
-		if [[ -n ${model_type} && -n ${model_name} ]]; then
-			if [[ ${model_type} == "ollama" || ${model_type} == "hf-gguf" ]]; then
-				# 如果有量化类型，添加到模型信息中
-				if [[ -n ${quantization} ]]; then
-					models_array+=("${model_type}:${model_name}:${quantization}")
-					log_verbose "Added model: ${model_type} -> ${model_name}:${quantization}"
-				else
-					models_array+=("${model_type}:${model_name}")
-					log_verbose "Added model: ${model_type} -> ${model_name}"
-				fi
-			else
-				log_warning "Unknown model type: ${model_type} (line: ${line})"
-			fi
-		else
-			log_warning "Ignoring invalid line: ${line}"
-		fi
-	done <"${models_file}"
-
-	# 检查是否找到有效模型
-	if [[ ${#models_array[@]} -eq 0 ]]; then
-		log_warning "================================ WARNING ================================"
-		log_warning "No valid models found in models.list file!"
-		log_warning "All model entries are either commented out or invalid."
-		log_warning ""
-		log_warning "Please edit the models.list file:"
-		log_warning "1. Uncomment (remove # at the beginning) the models you need"
-		log_warning "2. Add your own model configurations"
-		log_warning "3. Check model search URLs in the comments for available models"
-		log_warning ""
-		log_warning "Examples:"
-		log_warning "  ollama deepseek-r1:1.5b"
-		log_warning "  hf-gguf hf.co/MaziyarPanahi/gemma-3-1b-it-GGUF"
-		log_warning "====================================================================="
-		echo
-	else
-		log_verbose "Total models parsed: ${#models_array[@]}"
-	fi
-}
-
-# 检查HuggingFace GGUF模型是否存在（通过Ollama检查）
-check_hf_gguf_model() {
-	local model_name="$1"
-	local model_tag="$2"
-	local full_model_name="${model_name}:${model_tag}"
-
-	# 使用容器检查
-	if check_ollama_model_exists "${full_model_name}"; then
-		log_verbose_success "HuggingFace GGUF model already exists: ${full_model_name}"
-		return 0
-	fi
-
-	log_verbose_warning "HuggingFace GGUF model does not exist: ${full_model_name}"
-	return 1
-}
-
-# 删除Ollama模型
-remove_ollama_model() {
-	local model_spec="$1"
-	local force_delete="${2:-false}"
-
-	# 解析模型名称和版本
-	if ! validate_model_format "${model_spec}"; then
-		return 1
-	fi
-
-	log_verbose "Preparing to remove Ollama model: ${model_spec}"
-
-	# 检查模型是否存在
-	local model_name model_version
-	if ! parse_model_spec "${model_spec}" model_name model_version; then
-		return 1
-	fi
-	if ! check_ollama_model "${model_name}" "${model_version}"; then
-		log_warning "Model does not exist, no need to delete: ${model_spec}"
-		return 0
-	fi
-
-	# 如果不是强制删除，询问用户确认
-	if [[ ${force_delete} != "true" ]]; then
-		log_warning "About to delete model: ${model_spec}"
-		echo -n "Confirm deletion? [y/N]: "
-		read -r confirm
-		if [[ ${confirm} != "y" && ${confirm} != "Y" ]]; then
-			log_verbose "Delete operation cancelled"
-			return 0
-		fi
-	fi
-
-	if execute_ollama_command "rm" "${model_spec}"; then
-		log_verbose_success "Ollama model deleted successfully: ${model_spec}"
-		return 0
-	else
-		log_error "Failed to delete Ollama model: ${model_spec}"
-		return 1
-	fi
-}
-
-# 获取模型相关的blob文件路径
-get_model_blob_paths() {
-	local manifest_file="$1"
-	local models_dir="$2"
-	local blob_paths=()
-
-	if [[ ! -f ${manifest_file} ]]; then
-		log_error "Model manifest file does not exist: ${manifest_file}"
-		return 1
-	fi
-
-	# 使用hf_downloader镜像中的jq解析JSON文件
-	local layers
-	layers=$(docker run --rm --entrypoint="" -v "$(dirname "${manifest_file}"):/data" hf_downloader jq -r '.layers[].digest, .config.digest' "/data/$(basename "${manifest_file}")" 2>/dev/null | sort -u)
-
-	# 构建blob文件路径
-	while IFS= read -r digest; do
-		if [[ -n ${digest} ]]; then
-			# 将 sha256:xxx 格式转换为 sha256-xxx
-			local blob_name="${digest//:/-}"
-			local blob_file="${models_dir}/blobs/${blob_name}"
-			blob_paths+=("${blob_file}")
-		fi
-	done <<<"${layers}"
-
-	# 输出路径
-	printf '%s\n' "${blob_paths[@]}"
-}
-
-# 检查备份完整性（检查备份中是否包含所有必需的blob文件）
-
-# 获取模型blob列表（带缓存）
-get_model_blobs_cached() {
-	local model_spec="$1"
-
-	# 检查缓存
-	if [[ -n ${MODEL_BLOB_CACHE[${model_spec}]-} ]]; then
-		echo "${MODEL_BLOB_CACHE[${model_spec}]}"
-		return 0
-	fi
-
-	# 解析模型名称和版本
-	local model_name model_version
-	if ! parse_model_spec "${model_spec}" model_name model_version; then
-		return 1
-	fi
-
-	# 确定manifest文件路径
-	local manifest_file
-	manifest_file=$(get_model_manifest_path "${model_name}" "${model_version}")
-
-	# 获取blob文件列表
-	if [[ -f ${manifest_file} ]]; then
-		local blobs
-		blobs=$(get_model_blob_paths "${manifest_file}" "${OLLAMA_MODELS_DIR}" | sed "s|^${OLLAMA_MODELS_DIR}/||")
-		if [[ -n ${blobs} ]]; then
-			# 缓存结果
-			MODEL_BLOB_CACHE[${model_spec}]="${blobs}"
-			echo "${blobs}"
-			return 0
-		fi
-	fi
-
-	return 1
-}
-
-# 快速检查单文件备份完整性
-
-# 清理完整性检查缓存
-clear_integrity_cache() {
-	[[ -n ${VERBOSE} ]] && log_verbose "Clearing integrity check cache"
-	unset BACKUP_CONTENT_CACHE
-	unset MODEL_BLOB_CACHE
-	declare -g -A BACKUP_CONTENT_CACHE
-	declare -g -A MODEL_BLOB_CACHE
-}
-
-# 确保完整性检查缓存已初始化
-ensure_cache_initialized() {
-	# Initialize cache arrays if they do not exist
-	if [[ ! -v BACKUP_CONTENT_CACHE ]] || [[ ! -v MODEL_BLOB_CACHE ]]; then
-		declare -g -A BACKUP_CONTENT_CACHE
-		declare -g -A MODEL_BLOB_CACHE
-		[[ -n ${VERBOSE} ]] && log_verbose "Integrity check cache initialized"
-	fi
-}
-
-# ==================================================================================
-#                           统一完整性验证架构
-# ==================================================================================
-
-# 通用完整性验证函数 - 统一所有验证逻辑的入口点
-verify_integrity() {
-	local verification_type="$1" # model, backup, hf_model
-	local target="$2"            # 目标文件/路径/模型规格
-	local options="${3-}"        # 附加选项 (use_cache:true, check_blobs:true, etc.)
-
-	# 解析选项
-	local use_cache="true"
-	local check_blobs="true"
-	local model_spec=""
-
-	# 解析选项字符串
-	if [[ -n ${options} ]]; then
-		while IFS=',' read -ra ADDR; do
-			for i in "${ADDR[@]}"; do
-				case "${i}" in
-				use_cache:*)
-					use_cache="${i#*:}"
-					;;
-				check_blobs:*)
-					check_blobs="${i#*:}"
-					;;
-				model_spec:*)
-					model_spec="${i#*:}"
-					;;
-				*)
-					# 忽略未知选项
-					;;
-				esac
-			done
-		done <<<"${options}"
-	fi
-
-	# 确保缓存已初始化
-	[[ ${use_cache} == "true" ]] && ensure_cache_initialized
-
-	# 根据验证类型调用相应的验证逻辑
-	case "${verification_type}" in
-	"model")
-		_verify_local_model "${target}" "${use_cache}" "${check_blobs}"
-		;;
-	"backup")
-		_verify_backup_target "${target}" "${model_spec}" "${use_cache}" "${check_blobs}"
-		;;
-	"backup_file")
-		_verify_backup_file "${target}" "${use_cache}"
-		;;
-	*)
-		log_error "Unknown verification type: ${verification_type}"
-		return 1
-		;;
-	esac
-}
-
-# 内部函数：验证本地模型完整性
-_verify_local_model() {
-	local model_spec="$1"
-	local use_cache="$2"
-	local check_blobs="$3"
-
-	# 解析模型规格
-	local model_name model_tag
-	if [[ ${model_spec} =~ ^(.+):(.+)$ ]]; then
-		model_name="${BASH_REMATCH[1]}"
-		model_tag="${BASH_REMATCH[2]}"
-	else
-		log_error "Invalid model spec format: ${model_spec}"
-		return 1
-	fi
-
-	# 确定manifest文件路径
-	local manifest_file
-	manifest_file=$(get_model_manifest_path "${model_name}" "${model_tag}")
-
-	# 检查manifest文件是否存在
-	[[ ! -f ${manifest_file} ]] && return 1
-
-	# 如果不需要检查blob，只验证manifest存在即可
-	[[ ${check_blobs} == "false" ]] && return 0
-
-	# 获取blob文件列表并验证
-	local blob_files
-	if [[ ${use_cache} == "true" ]]; then
-		blob_files=$(get_model_blobs_cached "${model_spec}")
-		[[ -z ${blob_files} ]] && return 1
-
-		# 检查每个blob文件
-		while IFS= read -r blob_relative_path; do
-			[[ -n ${blob_relative_path} && ! -f "${OLLAMA_MODELS_DIR}/${blob_relative_path}" ]] && return 1
-		done <<<"${blob_files}"
-	else
-		blob_files=$(get_model_blob_paths "${manifest_file}" "${OLLAMA_MODELS_DIR}")
-		[[ -z ${blob_files} ]] && return 1
-
-		# 检查每个blob文件
-		while IFS= read -r blob_file; do
-			[[ -n ${blob_file} && ! -f ${blob_file} ]] && return 1
-		done <<<"${blob_files}"
-	fi
-
-	return 0
-}
-
-# 内部函数：验证备份目标（目录备份）
-_verify_backup_target() {
-	local backup_target="$1"
-	local model_spec="$2"
-	local use_cache="$3"
-	local check_blobs="$4"
-
-	# 检查目录备份
-	if [[ -d ${backup_target} ]]; then
-		# Verify directory structure
-		if [[ -d "${backup_target}/manifests" ]] && [[ -d "${backup_target}/blobs" ]]; then
-			# Verify MD5 checksum
-			local md5_file="${backup_target}.md5"
-			if [[ -f ${md5_file} ]]; then
-				if verify_directory_md5 "${backup_target}" "${md5_file}"; then
-					[[ -n ${VERBOSE} ]] && log_info "Directory backup MD5 checksum verified: ${backup_target}"
-					return 0
-				else
-					log_error "Directory backup MD5 checksum failed: ${backup_target}"
-					return 1
-				fi
-			else
-				log_warning "MD5 checksum file not found: ${md5_file}"
-				return 0 # No MD5 file is still considered valid, but a warning is logged
-			fi
-		else
-			log_error "Invalid directory backup structure: ${backup_target}"
-			return 1
-		fi
-	fi
-
-	return 1
-}
-
-# 内部函数：验证模型文件完整性
-
-# 内部函数：验证备份文件（业务逻辑完整性）
-_verify_backup_file() {
-	local backup_dir="$1"
-	local use_detailed_check="$2"
-
-	[[ ! -d ${backup_dir} ]] && return 1
-
-	# 基本目录结构检查
-	if [[ ! -d ${backup_dir}/manifests ]] || [[ ! -d ${backup_dir}/blobs ]]; then
-		return 1
-	fi
-
-	# 检查是否有manifest文件
-	if ! find "${backup_dir}/manifests" -type f -name "*" | head -1 | read -r; then
-		return 1
-	fi
-
-	# 如果需要详细检查，执行业务逻辑验证
-	[[ ${use_detailed_check} == "true" ]] && validate_ollama_model_integrity "${backup_dir}"
-}
-
-# 删除不完整的备份文件
-remove_incomplete_backup() {
-	local backup_base="$1"
-	local backup_suffix="${2-}"
-
-	log_verbose "Deleting incomplete backup: ${backup_base}${backup_suffix}"
-
-	# 删除目录备份
-	local backup_dir="${backup_base}${backup_suffix}"
-	if [[ -d ${backup_dir} ]]; then
-		rm -rf "${backup_dir}"
-		log_verbose "Backup directory deleted: ${backup_dir}"
-	fi
-
-	# 删除MD5校验文件
-	local md5_file="${backup_dir}.md5"
-	if [[ -f ${md5_file} ]]; then
-		rm -f "${md5_file}"
-		log_verbose "MD5 checksum file deleted: ${md5_file}"
-	fi
-
-	# 删除备份信息文件
-	local info_file="${backup_base}${backup_suffix}_info.txt"
-	if [[ -f ${info_file} ]]; then
-		rm -f "${info_file}"
-		log_verbose "Backup info file deleted: ${info_file}"
-	fi
-}
-
-# 安全的临时文件创建
-create_temp_file() {
-	local prefix="${1:-temp}"
-	local temp_file
-	temp_file=$(mktemp) || {
-		log_error "Unable to create temporary file"
-		return 1
-	}
-	echo "${temp_file}"
-}
-
-# 创建模型备份目录
-create_model_backup_dir() {
-	local model_spec="$1"
-	local base_backup_dir="$2"
-	local model_safe_name
-	model_safe_name=$(get_safe_model_name "${model_spec}")
-	local model_backup_dir="${base_backup_dir}/${model_safe_name}"
-
-	# 创建备份目录
-	if ! mkdir -p "${model_backup_dir}"; then
-		log_error "Unable to create backup directory: ${model_backup_dir}"
-		return 1
-	fi
-	echo "${model_backup_dir}"
-}
-
-# 生成备份基础路径
-get_backup_base_path() {
-	local model_spec="$1"
-	local backup_dir="$2"
-	local suffix="${3-}"
-	local model_safe_name
-	model_safe_name=$(get_safe_model_name "${model_spec}")
-	echo "${backup_dir}/${model_safe_name}${suffix}"
-}
-
-# 备份信息和管理函数
-
 # 创建备份信息文件
+
 create_backup_info() {
 	local model_spec="$1"
 	local backup_base="$2"
@@ -2207,7 +1740,391 @@ EOF
 	fi
 }
 
-# 列出已安装的Ollama模型及详细信息
+# 恢复模型的统一入口函数（从文件路径恢复）
+
+remove_incomplete_backup() {
+	local backup_base="$1"
+	local backup_suffix="${2-}"
+
+	log_verbose "Deleting incomplete backup: ${backup_base}${backup_suffix}"
+
+	# 删除目录备份
+	local backup_dir="${backup_base}${backup_suffix}"
+	if [[ -d ${backup_dir} ]]; then
+		rm -rf "${backup_dir}"
+		log_verbose "Backup directory deleted: ${backup_dir}"
+	fi
+
+	# 删除MD5校验文件
+	local md5_file="${backup_dir}.md5"
+	if [[ -f ${md5_file} ]]; then
+		rm -f "${md5_file}"
+		log_verbose "MD5 checksum file deleted: ${md5_file}"
+	fi
+
+	# 删除备份信息文件
+	local info_file="${backup_base}${backup_suffix}_info.txt"
+	if [[ -f ${info_file} ]]; then
+		rm -f "${info_file}"
+		log_verbose "Backup info file deleted: ${info_file}"
+	fi
+}
+
+# 安全的临时文件创建
+
+#=============================================
+# 12. 模型恢复模块 (Model Restore)
+#=============================================
+
+restore_model() {
+	local restore_file="$1"
+	local force_restore="${2:-false}"
+
+	# 处理路径解析
+	local restore_path="${restore_file}"
+	if [[ ${restore_file} != /* ]]; then
+		restore_path="${BACKUP_OUTPUT_DIR}/${restore_file}"
+	fi
+
+	# 检查路径是否存在
+	if [[ ! -d ${restore_path} ]]; then
+		log_error "Backup directory does not exist: ${restore_path}"
+		return 1
+	fi
+
+	# 分发到具体的恢复实现
+	_restore_by_type "ollama" "${restore_path}" "${force_restore}"
+}
+
+# 尝试从备份自动恢复模型（从模型信息恢复）
+
+try_restore_model() {
+	local -n model_info_ref=$1
+
+	case "${model_info_ref[type]}" in
+	"ollama" | "hf-gguf")
+		_auto_restore_from_backup "${model_info_ref[type]}" "${model_info_ref[name]}" "${model_info_ref[tag]}"
+		;;
+	*)
+		log_error "Unsupported model type for restore: ${model_info_ref[type]}"
+		return 1
+		;;
+	esac
+}
+
+# 内部函数：自动恢复实现
+
+_auto_restore_from_backup() {
+	local model_type="$1"
+	local model_name="$2"
+	local model_tag="$3"
+	local model_spec="${model_name}:${model_tag}"
+
+	log_verbose "Checking for model backup: ${model_spec}"
+
+	# 获取备份路径
+	local backup_model_dir
+	backup_model_dir=$(get_model_backup_path "${model_name}" "${model_tag}")
+
+	# 检查备份是否存在
+	if [[ ! -d ${backup_model_dir} ]]; then
+		log_verbose "No backup found: ${backup_model_dir}"
+		return 1
+	fi
+
+	log_verbose_success "Found model backup: ${backup_model_dir}"
+	log_verbose "Restoring model from backup..."
+
+	# 调用统一的恢复实现
+	if _restore_by_type "${model_type}" "${backup_model_dir}" "true"; then
+		log_success "Successfully restored model from backup: ${model_spec}"
+		return 0
+	else
+		log_warning "Failed to restore model from backup"
+		return 1
+	fi
+}
+
+# 内部函数：按类型分发恢复（统一接口）
+
+_restore_by_type() {
+	local model_type="$1"
+	local backup_path="$2"
+	local force_restore="${3:-false}"
+
+	case "${model_type}" in
+	"ollama" | "hf-gguf")
+		_restore_ollama_implementation "${backup_path}" "${force_restore}"
+		;;
+	*)
+		log_error "Unsupported model type for restore: ${model_type}"
+		return 1
+		;;
+	esac
+}
+
+# 内部函数：Ollama模型恢复的核心实现
+
+_restore_ollama_implementation() {
+	local backup_dir="$1"
+	local force_restore="${2:-false}"
+
+	log_info "Restoring model: $(basename "${backup_dir}")"
+
+	# 验证备份结构
+	if ! _validate_backup_structure "${backup_dir}"; then
+		return 1
+	fi
+
+	# 执行完整性校验
+	if ! _verify_backup_integrity "${backup_dir}" "${force_restore}"; then
+		return 1
+	fi
+
+	# 检查文件冲突
+	if ! _check_restore_conflicts "${backup_dir}" "${force_restore}"; then
+		return 1
+	fi
+
+	# 执行文件恢复
+	if ! _perform_files_restore "${backup_dir}"; then
+		return 1
+	fi
+
+	log_verbose_success "Model restore completed"
+	return 0
+}
+
+# 内部函数：验证备份结构
+
+_validate_backup_structure() {
+	local backup_dir="$1"
+
+	if [[ ! -d ${backup_dir} ]]; then
+		log_error "Backup directory does not exist: ${backup_dir}"
+		return 1
+	fi
+
+	if [[ ! -d "${backup_dir}/manifests" ]] || [[ ! -d "${backup_dir}/blobs" ]]; then
+		log_error "Invalid backup structure: missing manifests or blobs directory"
+		return 1
+	fi
+
+	return 0
+}
+
+# 内部函数：验证备份完整性
+
+_verify_backup_integrity() {
+	local backup_dir="$1"
+	local force_restore="$2"
+
+	local md5_file="${backup_dir}.md5"
+	if [[ ! -f ${md5_file} ]]; then
+		log_warning "Skipping integrity check: MD5 file not found"
+		return 0
+	fi
+
+	log_info "Verifying backup integrity..."
+	if verify_directory_md5 "${backup_dir}" "${md5_file}"; then
+		log_verbose_success "MD5 verification passed"
+		return 0
+	else
+		log_error "Backup integrity check failed"
+		if [[ ${force_restore} == "true" ]]; then
+			log_warning "Force restore mode, continuing..."
+			return 0
+		else
+			return 1
+		fi
+	fi
+}
+
+# 内部函数：检查恢复冲突
+
+_check_restore_conflicts() {
+	local backup_dir="$1"
+	local force_restore="$2"
+
+	if [[ ${force_restore} == "true" ]]; then
+		return 0
+	fi
+
+	log_info "Checking for file conflicts..."
+	local conflicts_found=false
+
+	for backup_subdir in manifests blobs; do
+		if find "${backup_dir}/${backup_subdir}" -type f 2>/dev/null | while read -r backup_file; do
+			local rel_path="${backup_file#"${backup_dir}/${backup_subdir}"/}"
+			local target_file="${OLLAMA_MODELS_DIR}/${backup_subdir}/${rel_path}"
+			if [[ -f ${target_file} ]]; then
+				echo "conflict"
+				break
+			fi
+		done | grep -q "conflict"; then
+			conflicts_found=true
+			break
+		fi
+	done
+
+	if [[ ${conflicts_found} == "true" ]]; then
+		log_error "File conflicts detected, use --force to override"
+		return 1
+	fi
+
+	return 0
+}
+
+# 内部函数：执行文件恢复
+
+_perform_files_restore() {
+	local backup_dir="$1"
+
+	# 创建目标目录
+	if ! mkdir -p "${OLLAMA_MODELS_DIR}/manifests" "${OLLAMA_MODELS_DIR}/blobs"; then
+		log_error "Failed to create Ollama directories"
+		return 1
+	fi
+
+	# 恢复manifest文件
+	log_verbose "Restoring model manifests..."
+	if ! cp -r "${backup_dir}/manifests/"* "${OLLAMA_MODELS_DIR}/manifests/"; then
+		log_error "Failed to restore manifest files"
+		return 1
+	fi
+
+	# 恢复blob文件
+	log_verbose "Restoring model data..."
+	if ! cp "${backup_dir}/blobs/"* "${OLLAMA_MODELS_DIR}/blobs/"; then
+		log_error "Failed to restore blob files"
+		return 1
+	fi
+
+	return 0
+}
+
+# 格式化字节大小为人类可读格式
+
+#=============================================
+# 13. 模型管理操作模块 (Model Management)
+#=============================================
+
+check_ollama_model_exists() {
+	local model_name="$1"
+
+	# 确保缓存已初始化
+	if ! init_ollama_cache; then
+		log_error "Failed to initialize Ollama model cache"
+		return 1
+	fi
+
+	# 在缓存中查找模型
+	if echo "${OLLAMA_MODELS_CACHE}" | grep -q "^${model_name}$"; then
+		return 0
+	else
+		return 1
+	fi
+}
+
+# 清理不完整的模型
+
+cleanup_incomplete_model() {
+	local model_name="$1"
+	local model_tag="$2"
+	local full_model_name="${model_name}:${model_tag}"
+
+	log_verbose_warning "Detected incomplete model, cleaning up: ${full_model_name}"
+
+	# 确定manifest文件路径
+	local manifest_file
+	manifest_file=$(get_model_manifest_path "${model_name}" "${model_tag}")
+
+	# 删除manifest文件
+	if [[ -f ${manifest_file} ]]; then
+		if docker_rm_rf "${manifest_file}"; then
+			log_verbose "Deleted incomplete manifest file: ${manifest_file}"
+		else
+			log_warning "Unable to delete manifest file: ${manifest_file}"
+		fi
+	fi
+
+	# 清除缓存，强制重新检查
+	OLLAMA_CACHE_INITIALIZED="false"
+	OLLAMA_MODELS_CACHE=""
+
+	log_verbose_success "Incomplete model cleanup completed: ${full_model_name}"
+}
+
+# 简化的模型检查函数
+
+check_ollama_model() {
+	local model_name="$1"
+	local model_tag="$2"
+	local full_model_name="${model_name}:${model_tag}"
+
+	# 首先尝试通过Ollama容器检查（最准确）
+	if check_ollama_model_exists "${full_model_name}"; then
+		log_verbose_success "Ollama model already exists: ${full_model_name}"
+		return 0
+	fi
+
+	# 如果Ollama容器检查失败，进行完整性检查（使用缓存优化）
+	local model_spec="${model_name}:${model_tag}"
+	if verify_integrity "model" "${model_spec}" "use_cache:true,check_blobs:true"; then
+		log_verbose_success "Ollama model exists (filesystem verification): ${full_model_name}"
+		return 0
+	else
+		log_verbose_warning "Ollama model does not exist or is incomplete: ${full_model_name}"
+		return 1
+	fi
+}
+
+# 解析模型规格（model:version格式）
+# shellcheck disable=SC2034  # nameref variables are used by reference
+
+remove_ollama_model() {
+	local model_spec="$1"
+	local force_delete="${2:-false}"
+
+	# 解析模型名称和版本
+	if ! validate_model_format "${model_spec}"; then
+		return 1
+	fi
+
+	log_verbose "Preparing to remove Ollama model: ${model_spec}"
+
+	# 检查模型是否存在
+	local model_name model_version
+	if ! parse_model_spec "${model_spec}" model_name model_version; then
+		return 1
+	fi
+	if ! check_ollama_model "${model_name}" "${model_version}"; then
+		log_warning "Model does not exist, no need to delete: ${model_spec}"
+		return 0
+	fi
+
+	# 如果不是强制删除，询问用户确认
+	if [[ ${force_delete} != "true" ]]; then
+		log_warning "About to delete model: ${model_spec}"
+		echo -n "Confirm deletion? [y/N]: "
+		read -r confirm
+		if [[ ${confirm} != "y" && ${confirm} != "Y" ]]; then
+			log_verbose "Delete operation cancelled"
+			return 0
+		fi
+	fi
+
+	if execute_ollama_command "rm" "${model_spec}"; then
+		log_verbose_success "Ollama model deleted successfully: ${model_spec}"
+		return 0
+	else
+		log_error "Failed to delete Ollama model: ${model_spec}"
+		return 1
+	fi
+}
+
+# 获取模型相关的blob文件路径
+
 list_installed_models() {
 	log_info "扫描已安装的模型..."
 
@@ -2411,6 +2328,7 @@ list_installed_models() {
 
 # 备份Ollama模型（直接复制）
 # 智能删除模型（自动识别模型类型）
+
 remove_model_smart() {
 	local model_input="$1"
 	local force_delete="${2:-false}"
@@ -2445,6 +2363,7 @@ remove_model_smart() {
 # 检测备份文件类型
 
 # 批量删除模型（根据models.list文件）
+
 remove_models_from_list() {
 	local models_file="$1"
 	local force_delete="${2:-false}"
@@ -2564,6 +2483,164 @@ remove_models_from_list() {
 
 # 检查Ollama模型在backups目录中是否有备份
 # 处理单个模型
+
+#=============================================
+# 14. 系统检查与初始化模块 (System Check)
+#=============================================
+
+check_gpu_support() {
+	# 检查是否支持NVIDIA GPU
+	if command_exists nvidia-smi && nvidia-smi &>/dev/null; then
+		return 0 # 支持GPU
+	fi
+	return 1 # 不支持GPU
+}
+
+check_dependencies() {
+	local missing_deps=()
+
+	# 检查 docker
+	if ! command_exists docker; then
+		missing_deps+=("docker")
+		log_error "Docker not installed or not in PATH"
+	else
+		# 检查 Docker 守护进程是否运行
+		if ! docker info &>/dev/null; then
+			log_error "Docker is installed but daemon is not running, please start Docker service"
+			return 1
+		fi
+	fi
+
+	# 检查 tar
+	if ! command_exists tar; then
+		missing_deps+=("tar")
+		log_error "tar not installed, required for model file packing/unpacking"
+	fi
+
+	# 如果有缺失的依赖，给出提示并退出
+	if [[ ${#missing_deps[@]} -gt 0 ]]; then
+		log_error "Missing required system dependencies: ${missing_deps[*]}"
+		log_error "Please install the missing dependencies and rerun the script"
+		return 1
+	fi
+
+	# 检查GPU支持（必需项）
+	if ! check_gpu_support; then
+		log_error "No NVIDIA GPU support detected. This script requires a GPU environment."
+		log_error "Please ensure: 1) NVIDIA drivers are installed  2) nvidia-smi tool is installed"
+		return 1
+	fi
+
+	log_verbose "NVIDIA GPU support detected, GPU acceleration will be enabled"
+
+	# 所有依赖检查通过，静默返回
+	return 0
+}
+
+# 解析模型列表文件
+
+#=============================================
+# 15. 任务执行与主程序模块 (Main Program)
+#=============================================
+
+execute_task() {
+	local task_name="$1"
+	local task_function="$2"
+	shift 2
+	local task_args=("$@")
+
+	log_info "Executing ${task_name}..."
+	if "${task_function}" "${task_args[@]}"; then
+		log_success "${task_name} completed"
+		exit 0
+	else
+		local exit_code=$?
+		if [[ ${exit_code} -eq 2 ]]; then
+			# 用户取消操作，不显示错误信息
+			exit 0
+		else
+			log_error "${task_name} failed"
+			exit 1
+		fi
+	fi
+}
+
+# 模型处理器 - 解析模型条目并返回处理函数
+
+show_help() {
+	cat <<'EOF'
+🤖 OMO - Oh My Ollama / Ollama Models Organizer
+
+使用方法:
+  ./omo.sh [OPTIONS]
+
+选项:
+  --models-file FILE    指定模型列表文件 (默认: ./models.list)
+  --ollama-dir DIR      指定Ollama数据目录 (默认: ./ollama)
+  --backup-dir DIR      备份目录 (默认: ./backups)
+  --install             安装/下载模型 (覆盖默认的仅检查行为)
+  --check-only          仅检查模型状态，不下载 (默认行为)
+  --force-download      强制重新下载所有模型 (自动启用安装模式)
+  --verbose             显示详细日志
+  --list                列出已安装的Ollama模型及详细信息
+  --backup MODEL        备份指定模型 (格式: 模型名:版本)
+  --backup-all          备份所有模型
+  --restore FILE        恢复指定备份文件
+  --remove MODEL        删除指定模型
+  --remove-all          删除所有模型
+  --force               强制操作（跳过确认）
+  --generate-compose    生成docker-compose.yaml文件（基于models.list）
+  --help                显示帮助信息
+
+模型列表文件格式:
+  ollama deepseek-r1:1.5b
+  hf-gguf hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
+
+下载缓存:
+  HuggingFace GGUF模型下载支持断点续传和缓存复用
+  每个模型有独立的缓存子目录
+  中断后重新运行脚本将恢复下载，完成后自动缓存
+
+EOF
+	cat <<'EOF'
+
+Ollama模型备份:
+  支持完整的Ollama模型备份和恢复
+  备份目录: ./backups (默认，可通过--backup-dir指定)
+  备份格式: 目录复制 (模型名/)
+  包含内容: manifest文件和所有blob数据
+  自动生成: MD5校验文件和详细信息文件
+  
+备份特性:
+  - 直接复制备份，无压缩处理，备份和恢复速度极快
+  - MD5校验确保文件完整性
+  - 每个模型独立文件夹，便于管理
+
+示例:
+  # 检查模型状态 (默认行为)
+  ./omo.sh
+  
+  # 安装/下载缺失的模型
+  ./omo.sh --install
+  
+  # 仅检查状态 (同默认行为)
+  ./omo.sh --check-only
+  
+  # 列出已安装的模型
+  ./omo.sh --list
+  
+  # 备份模型
+  ./omo.sh --backup tinyllama:latest
+  
+  # 删除模型
+  ./omo.sh --remove llama2:7b --force
+
+EOF
+}
+
+# 检查依赖
+# 检查GPU支持
+
 process_model() {
 	local model_entry="$1"
 	local force_download="$2"
@@ -2613,6 +2690,7 @@ process_model() {
 }
 
 # 主函数
+
 main() {
 	# 获取主机时区
 	HOST_TIMEZONE=$(get_host_timezone)
