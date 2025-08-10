@@ -218,13 +218,11 @@ download_model() {
 	local -n model_info_ref=$1
 
 	case "${model_info_ref[type]}" in
-	"ollama")
+	"ollama" | "hf-gguf")
 		download_ollama_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
 		;;
-	"hf-gguf")
-		download_hf_gguf_model "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
 	*)
+		log_error "Unsupported model type: ${model_info_ref[type]}"
 		return 1
 		;;
 	esac
@@ -234,14 +232,13 @@ download_model() {
 try_restore_model() {
 	local -n model_info_ref=$1
 
+	# 所有支持的模型类型都使用相同的恢复方法
 	case "${model_info_ref[type]}" in
-	"ollama")
-		try_restore_ollama_from_backup "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
-	"hf-gguf")
+	"ollama" | "hf-gguf")
 		try_restore_ollama_from_backup "${model_info_ref[name]}" "${model_info_ref[tag]}"
 		;;
 	*)
+		log_error "Unsupported model type: ${model_info_ref[type]}"
 		return 1
 		;;
 	esac
@@ -349,88 +346,6 @@ wait_for_ollama_ready() {
 	log_error "Timeout waiting for Ollama service to be ready (${max_attempts} seconds)"
 	show_container_logs "${container_name}"
 	return 1
-}
-
-# 构建完整的Docker运行命令
-build_full_docker_cmd() {
-	local container_name="$1"
-	local use_gpu="${2:-true}"
-	local _include_hf_token="${3:-false}" # Currently unused, reserved for future use
-	local extra_env=()
-	local extra_volumes=()
-
-	# 处理额外的环境变量和挂载卷参数
-	shift 3
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-		--env)
-			extra_env+=("$2")
-			shift 2
-			;;
-		--volume)
-			extra_volumes+=("$2")
-			shift 2
-			;;
-		*)
-			break
-			;;
-		esac
-	done
-
-	local docker_cmd=("docker" "run" "--name" "${container_name}" "--rm" "-t")
-
-	# GPU支持
-	if [[ ${use_gpu} == "true" ]]; then
-		docker_cmd+=("--gpus" "all")
-	fi
-
-	# 基础环境变量
-	docker_cmd+=("-e" "PYTHONUNBUFFERED=1")
-	docker_cmd+=("-e" "TERM=xterm-256color")
-	docker_cmd+=("-v" "/etc/localtime:/etc/localtime:ro")
-	docker_cmd+=("-e" "TZ=${HOST_TIMEZONE:-UTC}")
-
-	# 添加额外的环境变量
-	for env_var in "${extra_env[@]}"; do
-		docker_cmd+=("-e" "${env_var}")
-	done
-
-	# 添加额外的挂载卷
-	for volume in "${extra_volumes[@]}"; do
-		docker_cmd+=("-v" "${volume}")
-	done
-
-	printf '%s\n' "${docker_cmd[@]}"
-}
-
-# 通用cleanup函数生成器
-create_cleanup_function() {
-	local cleanup_name="$1"
-	shift
-	local cleanup_items_str="$*"
-
-	# 动态创建cleanup函数
-	eval "${cleanup_name}() {
-        local item
-        local cleanup_items=(${cleanup_items_str})
-        for item in \"\${cleanup_items[@]}\"; do
-            if [[ -f \"\$item\" ]]; then
-                rm -f \"\$item\"
-            elif [[ -d \"\$item\" ]]; then
-                rm -rf \"\$item\"
-            elif [[ \"\$item\" =~ ^[a-zA-Z0-9_-]+\$ ]]; then
-                # 假设是容器名
-                docker rm -f \"\$item\" &>/dev/null || true
-            fi
-        done
-    }"
-}
-
-# 设置cleanup trap的通用函数
-setup_cleanup_trap() {
-	local cleanup_function="$1"
-	local signals="${2:-EXIT INT TERM}"
-	trap '$cleanup_function' "${signals}"
 }
 
 # Ollama模型列表缓存
@@ -1133,46 +1048,23 @@ download_ollama_model() {
 	local model_name="$1"
 	local model_tag="$2"
 
-	log_info "Downloading model: ${model_name}:${model_tag}"
-
-	if execute_ollama_command "pull" "${model_name}:${model_tag}"; then
-		log_verbose_success "Ollama model download completed: ${model_name}:${model_tag}"
-
-		# 验证下载后的模型完整性
-		if verify_model_after_installation "${model_name}" "${model_tag}"; then
-			log_verbose_success "Model integrity check passed: ${model_name}:${model_tag}"
-			return 0
-		else
-			log_verbose_warning "Model integrity check failed, model has been removed: ${model_name}:${model_tag}"
-			return 1
-		fi
-	else
-		log_error "Failed to download Ollama model: ${model_name}:${model_tag}"
-		return 1
-	fi
-}
-
-# 下载HuggingFace GGUF模型（通过Ollama直接下载）
-download_hf_gguf_model() {
-	local model_name="$1"
-	local model_tag="$2"
 	local full_model_name="${model_name}:${model_tag}"
 
-	log_verbose "Starting download of HuggingFace GGUF model: ${full_model_name}"
+	log_info "Downloading: ${full_model_name}"
 
 	if execute_ollama_command "pull" "${full_model_name}"; then
-		log_verbose_success "HuggingFace GGUF model download completed: ${full_model_name}"
+		log_verbose_success "Downloaded: ${full_model_name}"
 
 		# 验证下载后的模型完整性
 		if verify_model_after_installation "${model_name}" "${model_tag}"; then
-			log_verbose_success "Model integrity check passed: ${full_model_name}"
+			log_verbose_success "Verified: ${full_model_name}"
 			return 0
 		else
-			log_error "Model integrity check failed, model has been removed: ${full_model_name}"
+			log_error "Verification failed: ${full_model_name}"
 			return 1
 		fi
 	else
-		log_error "Failed to download HuggingFace GGUF model: ${full_model_name}"
+		log_error "Download failed: ${full_model_name}"
 		return 1
 	fi
 }
