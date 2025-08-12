@@ -1620,13 +1620,13 @@ EOF
 #=============================================
 #
 # 模型恢复逻辑说明：
-# 
+#
 # 1. 恢复流程：
 #    ├── 备份结构验证 (_validate_backup_structure)
 #    │   ├── 检查备份目录存在性
 #    │   ├── 验证manifests/blobs目录结构
 #    │   └── 确认包含实际文件（非空备份）
-#    ├── 备份完整性验证 (_verify_backup_integrity) 
+#    ├── 备份完整性验证 (_verify_backup_integrity)
 #    │   ├── 检查MD5校验文件存在性
 #    │   ├── 计算当前备份目录的MD5值
 #    │   └── 对比验证文件完整性
@@ -1652,7 +1652,7 @@ EOF
 # 3. 安全机制：
 #    - 完整性检查：防止损坏备份的错误恢复
 #    - 冲突检测：避免意外覆盖现有模型文件
-#    - 权限管理：通过Docker容器处理文件权限问题  
+#    - 权限管理：通过Docker容器处理文件权限问题
 #    - 错误恢复：提供清晰的错误信息和解决建议
 #    - 详细日志：记录每个步骤的执行状态
 #
@@ -1933,50 +1933,20 @@ _perform_files_restore() {
 # 13. 模型管理操作模块 (Model Management)
 #=============================================
 
-# 清理不完整的模型
-
-cleanup_incomplete_model() {
-	local model_name="$1"
-	local model_tag="$2"
-	local full_model_name="${model_name}:${model_tag}"
-
-	log_verbose_warning "Detected incomplete model, cleaning up: ${full_model_name}"
-
-	# 确定manifest文件路径
-	local manifest_file
-	manifest_file=$(get_model_manifest_path "${model_name}" "${model_tag}")
-
-	# 删除manifest文件
-	if [[ -f ${manifest_file} ]]; then
-		if rm -f "${manifest_file}" 2>/dev/null; then
-			log_verbose "Deleted incomplete manifest file: ${manifest_file}"
-		else
-			log_warning "Unable to delete manifest file: ${manifest_file}"
-		fi
-	fi
-
-	# 清除缓存，强制重新检查
-	OLLAMA_CACHE_INITIALIZED="false"
-	OLLAMA_MODELS_CACHE=""
-
-	log_verbose_success "Incomplete model cleanup completed: ${full_model_name}"
-}
 
 remove_ollama_model() {
 	local model_spec="$1"
 	local force_delete="${2:-false}"
 
-	if ! validate_model_format "${model_spec}"; then
+	# 解析并验证模型格式（一次性完成验证和解析）
+	local model_name model_version
+	if ! parse_model_spec "${model_spec}" model_name model_version; then
 		return 1
 	fi
 
 	log_verbose "Preparing to remove Ollama model: ${model_spec}"
 
 	# 检查模型是否存在
-	local model_name model_version
-	if ! parse_model_spec "${model_spec}" model_name model_version; then
-		return 1
-	fi
 	if ! check_ollama_model "${model_name}" "${model_version}"; then
 		log_warning "Model does not exist, no need to delete: ${model_spec}"
 		return 0
@@ -1993,48 +1963,17 @@ remove_ollama_model() {
 		fi
 	fi
 
+	# 执行删除
 	if execute_ollama_command "rm" "false" "${model_spec}"; then
-		log_verbose_success "Ollama model deleted successfully: ${model_spec}"
+		log_verbose_success "Model deleted successfully: ${model_spec}"
 		return 0
 	else
-		log_error "Failed to delete Ollama model: ${model_spec}"
+		log_error "Failed to delete model: ${model_spec}"
 		return 1
 	fi
 }
 
-# 备份Ollama模型（直接复制）
-# 智能删除模型（自动识别模型类型）
 
-remove_model_smart() {
-	local model_input="$1"
-	local force_delete="${2:-false}"
-
-	log_info "删除模型: ${model_input}"
-
-	# 检查输入格式，判断是什么类型的模型
-	if [[ ${model_input} =~ ^([^:]+):(.+)$ ]]; then
-		local model_name="${BASH_REMATCH[1]}"
-		local model_tag_or_quant="${BASH_REMATCH[2]}"
-
-		# 先检查是否是Ollama模型（直接格式：model:tag）
-		if check_ollama_model "${model_name}" "${model_tag_or_quant}"; then
-			if remove_ollama_model "${model_input}" "${force_delete}"; then
-				return 0
-			else
-				return 1
-			fi
-		fi
-
-		# Model not found
-		log_error "Model not found or unsupported format: ${model_input}"
-		return 1
-
-	else
-		log_error "模型格式错误，应为 '模型名:版本' 或 '模型名:量化类型'"
-		log_error "例如: 'llama2:7b' 或 'microsoft/DialoGPT-small:q4_0'"
-		return 1
-	fi
-}
 
 # 批量删除模型（根据models.list文件）
 
@@ -2042,13 +1981,13 @@ remove_models_from_list() {
 	local models_file="$1"
 	local force_delete="${2:-false}"
 
-	log_verbose "Batch deleting models..."
-	log_verbose "Model list file: ${models_file}"
-	log_info "Force delete mode: ${force_delete}"
+	log_verbose "Batch deleting models from: ${models_file}"
 
 	# 解析模型列表
 	local models=()
-	parse_models_list "${models_file}" models
+	if ! parse_models_list "${models_file}" models; then
+		return 1
+	fi
 
 	if [[ ${#models[@]} -eq 0 ]]; then
 		log_warning "No models found for deletion"
@@ -2056,27 +1995,38 @@ remove_models_from_list() {
 	fi
 
 	local total_models=${#models[@]}
-	local processed=0
-	local success=0
-	local failed=0
+	log_verbose "Found ${total_models} models for deletion"
 
-	log_verbose "共找到 ${total_models} 个模型进行删除"
+	# 预解析所有模型（避免重复解析）
+	local -a parsed_models=()
+	local invalid_count=0
+	for model in "${models[@]}"; do
+		local model_info
+		declare -A model_info
+		if parse_model_entry "${model}" model_info; then
+			# 存储解析结果（格式：type|name|tag|display）
+			parsed_models+=("${model_info[type]}|${model_info[name]}|${model_info[tag]}|${model_info[display]}")
+		else
+			log_error "Invalid model format, skipping: ${model}"
+			((invalid_count++))
+		fi
+	done
+
+	local valid_models=$((total_models - invalid_count))
+	if [[ ${valid_models} -eq 0 ]]; then
+		log_error "No valid models available for deletion"
+		return 1
+	fi
 
 	# 如果不是强制删除，显示要删除的模型列表并请求确认
 	if [[ ${force_delete} != "true" ]]; then
 		log_warning "The following models will be deleted:"
-		for model in "${models[@]}"; do
-			if [[ ${model} =~ ^ollama:([^:]+):(.+)$ ]]; then
-				local model_name="${BASH_REMATCH[1]}"
-				local model_tag="${BASH_REMATCH[2]}"
-				echo "  - Ollama模型: ${model_name}:${model_tag}"
-			elif [[ ${model} =~ ^hf-gguf:(.+)$ ]]; then
-				local model_full_name="${BASH_REMATCH[1]}"
-				echo "  - HuggingFace GGUF模型: ${model_full_name}"
-			fi
+		for parsed_model in "${parsed_models[@]}"; do
+			IFS='|' read -r type name tag display <<< "${parsed_model}"
+			echo "  - ${display}"
 		done
 		echo ""
-		echo -n "Confirm deletion of all these models? [y/N]: "
+		echo -n "Confirm deletion of ${valid_models} models? [y/N]: "
 		read -r confirm
 		if [[ ${confirm} != "y" && ${confirm} != "Y" ]]; then
 			log_info "Cancelled batch delete operation"
@@ -2085,68 +2035,34 @@ remove_models_from_list() {
 		echo ""
 	fi
 
-	for model in "${models[@]}"; do
+	# 执行批量删除
+	local processed=0
+	local success=0
+	local failed=0
+
+	for parsed_model in "${parsed_models[@]}"; do
 		((processed++))
-		log_info "Deleting model [${processed}/${total_models}]: ${model}"
+		IFS='|' read -r model_type model_name model_tag model_display <<< "${parsed_model}"
+		local model_spec="${model_name}:${model_tag}"
+		log_info "Deleting model [${processed}/${valid_models}]: ${model_display}"
 
-		# 解析模型条目
-		if [[ ${model} =~ ^ollama:([^:]+):(.+)$ ]]; then
-			local model_name="${BASH_REMATCH[1]}"
-			local model_tag="${BASH_REMATCH[2]}"
-			local model_spec="${model_name}:${model_tag}"
-
-			log_verbose "删除Ollama模型: ${model_spec}"
-
-			if remove_ollama_model "${model_spec}" "true"; then
-				((success++))
-				log_verbose_success "Ollama模型删除成功: ${model_spec}"
-			else
-				((failed++))
-				log_error "Ollama模型删除失败: ${model_spec}"
-			fi
-
-		elif [[ ${model} =~ ^hf-gguf:(.+)$ ]]; then
-			local model_full_name="${BASH_REMATCH[1]}"
-
-			# 解析HuggingFace GGUF模型名称
-			if [[ ${model_full_name} =~ ^(.+):(.+)$ ]]; then
-				local model_name="${BASH_REMATCH[1]}"
-				local model_tag="${BASH_REMATCH[2]}"
-			else
-				local model_name="${model_full_name}"
-				local model_tag="latest"
-			fi
-
-			local model_spec="${model_name}:${model_tag}"
-			log_verbose "删除HuggingFace GGUF模型: ${model_spec}"
-
-			if remove_ollama_model "${model_spec}" "true"; then
-				((success++))
-				log_verbose_success "HuggingFace GGUF模型删除成功: ${model_spec}"
-			else
-				((failed++))
-				log_error "HuggingFace GGUF模型删除失败: ${model_spec}"
-			fi
-
+		# 批量删除时强制执行（跳过个别确认）
+		if remove_ollama_model "${model_spec}" "true"; then
+			((success++))
+			log_verbose_success "Deleted successfully: ${model_spec}"
 		else
-			log_error "无效的模型条目格式: ${model}"
 			((failed++))
+			log_error "Failed to delete: ${model_spec}"
 		fi
-
-		echo "" # 添加空行分隔
 	done
 
 	# 显示删除总结
-	log_verbose_success "批量删除完成 (${success}/${total_models})"
-	if [[ ${failed} -gt 0 ]]; then
-		log_warning "删除失败: ${failed}"
-	fi
-
+	log_info "Batch deletion completed: ${success} succeeded, ${failed} failed"
 	if [[ ${failed} -eq 0 ]]; then
-		log_verbose_success "全部模型删除完成"
+		log_verbose_success "All models deleted successfully"
 		return 0
 	else
-		log_warning "部分模型删除失败"
+		log_warning "Some models failed to delete"
 		return 1
 	fi
 }
@@ -2902,7 +2818,7 @@ main() {
 	elif [[ -n ${RESTORE_FILE} ]]; then
 		execute_task "model restore" restore_model "${RESTORE_FILE}" "${FORCE_RESTORE}"
 	elif [[ -n ${REMOVE_MODEL} ]]; then
-		execute_task "model removal" remove_model_smart "${REMOVE_MODEL}" "${FORCE_RESTORE}"
+		execute_task "model removal" remove_ollama_model "${REMOVE_MODEL}" "${FORCE_RESTORE}"
 	elif [[ ${REMOVE_ALL} == "true" ]]; then
 		execute_task "batch delete" remove_models_from_list "${MODELS_FILE}" "${FORCE_RESTORE}"
 	fi
