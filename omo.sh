@@ -121,14 +121,17 @@ command_exists() {
 #=============================================
 
 log_info() {
+	[[ ${_LOG_SUPPRESSED} == "true" ]] && return 0
 	printf "${BLUE}[INFO]${NC} %s\n" "$1"
 }
 
 log_success() {
+	[[ ${_LOG_SUPPRESSED} == "true" ]] && return 0
 	printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
 }
 
 log_warning() {
+	[[ ${_LOG_SUPPRESSED} == "true" ]] && return 0
 	printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
 }
 
@@ -139,6 +142,7 @@ log_error() {
 # Verbose-only logging functions
 
 log_verbose() {
+	[[ ${_LOG_SUPPRESSED} == "true" ]] && return 0
 	if [[ ${VERBOSE} == "true" ]]; then
 		printf "${BLUE}[INFO]${NC} %s\n" "$1"
 	fi
@@ -146,13 +150,26 @@ log_verbose() {
 }
 
 log_verbose_success() {
+	[[ ${_LOG_SUPPRESSED} == "true" ]] && return 0
 	[[ ${VERBOSE} == "true" ]] && printf "${GREEN}[SUCCESS]${NC} %s\n" "$1"
 	return 0
 }
 
 log_verbose_warning() {
+	[[ ${_LOG_SUPPRESSED} == "true" ]] && return 0
 	[[ ${VERBOSE} == "true" ]] && printf "${YELLOW}[WARNING]${NC} %s\n" "$1"
 	return 0
+}
+
+# 日志屏蔽机制
+_LOG_SUPPRESSED="false"
+
+suppress_logging() {
+	_LOG_SUPPRESSED="true"
+}
+
+restore_logging() {
+	_LOG_SUPPRESSED="false"
 }
 
 #=============================================
@@ -955,14 +972,17 @@ _parse_model_path() {
 }
 
 list_installed_models() {
-	log_info "Scanning installed models..."
+	# 屏蔽日志输出以获得清洁的显示
+	suppress_logging
+	echo "Scanning installed models..."
 
 	# 初始化缓存以提高完整性检查性能
 	ensure_cache_initialized
 
 	# 检查Ollama模型目录是否存在
 	if [[ ! -d ${OLLAMA_MODELS_DIR} ]]; then
-		log_error "Ollama models directory does not exist: ${OLLAMA_MODELS_DIR}"
+		echo "ERROR: Ollama models directory does not exist: ${OLLAMA_MODELS_DIR}"
+		restore_logging
 		return 1
 	fi
 
@@ -970,7 +990,8 @@ list_installed_models() {
 
 	# 检查manifests基础目录是否存在
 	if [[ ! -d ${manifests_base_dir} ]]; then
-		log_warning "No installed models found"
+		echo "WARNING: No installed models found"
+		restore_logging
 		return 0
 	fi
 
@@ -1102,17 +1123,11 @@ list_installed_models() {
 	fi
 	echo "  📁 Directory: ${OLLAMA_MODELS_DIR}"
 
-	# 显示磁盘使用情况
-	local disk_usage
-	if disk_usage=$(du -sh "${OLLAMA_MODELS_DIR}" 2>/dev/null || true); then
-		local disk_size
-		disk_size=$(echo "${disk_usage}" | cut -f1)
-		echo "  🗄️ Disk usage: ${disk_size}"
-	fi
-
 	echo "============================================================"
 	echo ""
 
+	# 恢复日志输出
+	restore_logging
 	return 0
 }
 
