@@ -65,6 +65,9 @@ ABS_OLLAMA_DATA_DIR=""
 
 # Docker镜像配置
 readonly DOCKER_IMAGE_OLLAMA="ollama/ollama:latest"
+readonly DOCKER_IMAGE_ONE_API="justsong/one-api:latest"
+readonly DOCKER_IMAGE_PROMPT_OPTIMIZER="linshen/prompt-optimizer:latest"
+readonly DOCKER_IMAGE_CHATGPT_NEXT_WEB="yidadaa/chatgpt-next-web:latest"
 
 # 运行时配置
 VERBOSE="false" # 详细模式开关
@@ -264,7 +267,7 @@ verify_directory_md5() {
 
 	# 定义清理函数避免变量作用域问题
 	cleanup_temp_md5() {
-		if [[ -n "${temp_md5:-}" ]]; then
+		if [[ -n ${temp_md5-} ]]; then
 			rm -f "${temp_md5}"
 		fi
 	}
@@ -588,7 +591,7 @@ parse_model_entry() {
 # 从文件中获取模型列表
 parse_models_list() {
 	local models_file="$1"
-	local -n models_array=${2:-models}
+	local -n models_array_ref=$2
 
 	if [[ ! -f ${models_file} ]]; then
 		log_error "Model list file does not exist: ${models_file}"
@@ -616,7 +619,7 @@ parse_models_list() {
 			# 使用parse_model_entry验证条目格式
 			local -A model_info
 			if parse_model_entry "${model_entry}" model_info; then
-				models_array+=("${model_entry}")
+				models_array_ref+=("${model_entry}")
 				log_verbose "Added model: ${model_info[display]}"
 			else
 				log_warning "Invalid model entry: ${model_entry} (line: ${line})"
@@ -627,7 +630,7 @@ parse_models_list() {
 	done <"${models_file}"
 
 	# 检查是否找到有效模型
-	if [[ ${#models_array[@]} -eq 0 ]]; then
+	if [[ ${#models_array_ref[@]} -eq 0 ]]; then
 		log_warning "================================ WARNING ================================"
 		log_warning "No valid models found in models.list file!"
 		log_warning "All model entries are either commented out or invalid."
@@ -643,7 +646,7 @@ parse_models_list() {
 		log_warning "====================================================================="
 		echo
 	else
-		log_verbose "Total models parsed: ${#models_array[@]}"
+		log_verbose "Total models parsed: ${#models_array_ref[@]}"
 	fi
 }
 
@@ -1722,7 +1725,7 @@ _auto_restore_from_backup() {
 _restore_ollama_implementation() {
 	local backup_dir="$1"
 	local force_restore="${2:-false}"
-	local auto_restore="${3:-false}"  # 新参数：是否为自动恢复
+	local auto_restore="${3:-false}" # 新参数：是否为自动恢复
 
 	log_info "Restoring model: $(basename "${backup_dir}")"
 
@@ -1799,7 +1802,7 @@ _validate_backup_structure() {
 _verify_backup_integrity() {
 	local backup_dir="$1"
 	local force_restore="$2"
-	local allow_skip_integrity="${3:-false}"  # 新参数：是否允许忽略MD5失败
+	local allow_skip_integrity="${3:-false}" # 新参数：是否允许忽略MD5失败
 
 	local md5_file="${backup_dir}.md5"
 	if [[ ! -f ${md5_file} ]]; then
@@ -1933,7 +1936,6 @@ _perform_files_restore() {
 # 13. 模型管理操作模块 (Model Management)
 #=============================================
 
-
 remove_ollama_model() {
 	local model_spec="$1"
 	local force_delete="${2:-false}"
@@ -1972,8 +1974,6 @@ remove_ollama_model() {
 		return 1
 	fi
 }
-
-
 
 # 批量删除模型（根据models.list文件）
 
@@ -2022,7 +2022,7 @@ remove_models_from_list() {
 	if [[ ${force_delete} != "true" ]]; then
 		log_warning "The following models will be deleted:"
 		for parsed_model in "${parsed_models[@]}"; do
-			IFS='|' read -r type name tag display <<< "${parsed_model}"
+			IFS='|' read -r type name tag display <<<"${parsed_model}"
 			echo "  - ${display}"
 		done
 		echo ""
@@ -2042,7 +2042,7 @@ remove_models_from_list() {
 
 	for parsed_model in "${parsed_models[@]}"; do
 		((processed++))
-		IFS='|' read -r model_type model_name model_tag model_display <<< "${parsed_model}"
+		IFS='|' read -r model_type model_name model_tag model_display <<<"${parsed_model}"
 		local model_spec="${model_name}:${model_tag}"
 		log_info "Deleting model [${processed}/${valid_models}]: ${model_display}"
 
@@ -2077,68 +2077,64 @@ update_existing_compose() {
 	local custom_models="$2"
 	local default_model="$3"
 
-	log_info "更新现有docker-compose.yaml文件中的CUSTOM_MODELS配置"
+	log_info "Updating CUSTOM_MODELS configuration in existing docker-compose.yaml file"
 
-	# 创建备份
-	local backup_file
-	backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
-	cp "${output_file}" "${backup_file}"
-	log_info "已备份所有文件: ${backup_file}"
-
-	# 使用Python脚本更新CUSTOM_MODELS环境变量
-	if grep -q "CUSTOM_MODELS=" "${output_file}"; then
-		# 使用Python来精确处理YAML文件中的多行CUSTOM_MODELS
-		# 使用临时文件存储多行内容
-		local temp_models_file
-		temp_models_file=$(mktemp)
-		echo "${custom_models}" >"${temp_models_file}"
-
-		# 使用纯shell实现替换功能
-		update_docker_compose_models() {
-			local file_path="$1"
-			local models_file="$2"
-			local default_model="$3"
-
-			# 读取新的模型配置
-			local new_models
-			new_models=$(cat "${models_file}")
-
-			# 创建临时文件
-			local temp_file
-			temp_file=$(mktemp)
-
-			# 简单替换CUSTOM_MODELS行
-			if grep -q 'CUSTOM_MODELS=' "${file_path}"; then
-				# 使用sed进行简单的行替换
-				sed "s|CUSTOM_MODELS=.*|CUSTOM_MODELS=${new_models}\"|" "${file_path}" >"${temp_file}"
-				cp "${temp_file}" "${file_path}"
-			fi
-
-			# 处理DEFAULT_MODEL替换
-			sed -E "s|(^[[:space:]]*-[[:space:]]*DEFAULT_MODEL=)[^[:space:]#]*(.*)|\\1${default_model}  # 自动设置为models.list第一个模型|" "${file_path}" >"${temp_file}"
-			cp "${temp_file}" "${file_path}"
-
-			# 清理临时文件
-			rm -f "${temp_file}"
-			return 0
-		}
-
-		if update_docker_compose_models "${output_file}" "${temp_models_file}" "${default_model}"; then
-			echo "SUCCESS"
-		else
-			echo "ERROR: Failed to update docker-compose.yaml"
-			exit 1
-		fi
-
-		# 清理临时文件
-		rm -f "${temp_models_file}"
-
-		log_success "成功更新docker-compose.yaml中的CUSTOM_MODELS配置"
-		log_info "更新内容: ${custom_models}"
-	else
-		log_error "未在docker-compose.yaml中找到CUSTOM_MODELS配置"
+	# Confirm overwrite with user
+	log_warning "The file ${output_file} will be overwritten."
+	printf "Do you want to continue? (y/N): "
+	read -r confirmation
+	if [[ ! ${confirmation} =~ ^[Yy]$ ]]; then
+		log_info "Operation cancelled by user"
 		return 1
 	fi
+
+	# Check if CUSTOM_MODELS exists in the file
+	if ! grep -q "CUSTOM_MODELS=" "${output_file}"; then
+		log_error "CUSTOM_MODELS configuration not found in docker-compose.yaml"
+		return 1
+	fi
+
+	# Create temporary file for processing
+	local temp_file
+	temp_file=$(mktemp) || {
+		log_error "Failed to create temporary file"
+		return 1
+	}
+
+	# Update CUSTOM_MODELS line - use line-by-line processing
+	local found_custom_models=false
+
+	while IFS= read -r line; do
+		if [[ ${line} =~ ^[[:space:]]*-[[:space:]]*\"?CUSTOM_MODELS= ]]; then
+			# Found CUSTOM_MODELS line, replace it completely
+			echo "      - \"CUSTOM_MODELS=${custom_models}\""
+			found_custom_models=true
+		elif [[ ${found_custom_models} == true ]] && [[ ${line} =~ ^[[:space:]]+[^-] ]] && [[ ! ${line} =~ ^[[:space:]]*-[[:space:]]* ]]; then
+			# Skip continuation lines of previous CUSTOM_MODELS (indented lines that are not new env vars)
+			continue
+		else
+			# Regular line - output as is
+			echo "${line}"
+		fi
+	done <"${output_file}" >"${temp_file}"
+
+	if [[ ${found_custom_models} != true ]]; then
+		log_error "CUSTOM_MODELS configuration not found in docker-compose.yaml"
+		return 1
+	fi
+
+	# Update DEFAULT_MODEL line
+	if ! sed -E "s|(^[[:space:]]*-[[:space:]]*DEFAULT_MODEL=)[^[:space:]#]*(.*)|\\1${default_model}  # Auto-set to first model from models.list|" "${temp_file}" >"${output_file}"; then
+		log_error "Failed to update DEFAULT_MODEL configuration"
+		return 1
+	fi
+
+	log_success "Successfully updated docker-compose.yaml configuration"
+	log_verbose "Updated models: ${custom_models}"
+	log_verbose "Updated default model: ${default_model}"
+
+	# Clean up temporary file
+	rm -f "${temp_file}"
 
 	return 0
 }
@@ -2147,120 +2143,90 @@ generate_docker_compose() {
 	local output_file="${1:-./docker-compose.yaml}"
 	local models_file="${MODELS_FILE:-./models.list}"
 
-	# 检查模型列表文件是否存在
+	# Check if model list file exists
 	if [[ ! -f ${models_file} ]]; then
-		log_error "模型列表文件不存在: ${models_file}"
+		log_error "Model list file not found: ${models_file}"
 		return 1
 	fi
 
-	# 检查是否已存在docker-compose.yaml文件
-	if [[ -f ${output_file} ]]; then
-		log_info "检测到现有docker-compose.yaml文件，将更新CUSTOM_MODELS配置"
+	# Parse models configuration in one pass
+	local custom_models_content default_model
+	parse_models_configuration "${models_file}" custom_models_content default_model
 
-		# 生成CUSTOM_MODELS内容
-		local custom_models_content
-		custom_models_content=$(generate_custom_models_list "${models_file}")
+	# Validate generated configuration
+	if [[ -z ${custom_models_content} ]]; then
+		log_error "No active models found in ${models_file}"
+		log_error "Please ensure at least one model is uncommented in the file"
+		return 1
+	fi
 
-		if [[ -z ${custom_models_content} ]]; then
-			log_warning "未找到激活的模型，将生成默认配置"
-			custom_models_content="-all"
-		fi
+	log_verbose "Generated CUSTOM_MODELS: ${custom_models_content}"
+	log_verbose "Detected default model: ${default_model}"
 
-		# 检查是否有可用的模型
-		if [[ ${custom_models_content} == "-all" ]]; then
-			log_error "错误: models.list 中没有找到可用的模型配置"
-			log_error "请确保 models.list 中至少有一个未被注释的模型配置"
-			return 1
-		fi
-
-		# 自动检测默认模型
-		local default_model
-		default_model=$(detect_default_model "${models_file}")
-
-		[[ -n ${VERBOSE} ]] && log_info "Generated CUSTOM_MODELS content"
-		[[ -n ${VERBOSE} ]] && log_info "Detected default model: ${default_model}"
-
-		# 更新现有文件
+	# Handle existing vs new file
+	if [[ -f ${output_file} && -s ${output_file} ]]; then
+		log_info "Updating existing docker-compose.yaml configuration"
 		update_existing_compose "${output_file}" "${custom_models_content}" "${default_model}"
 	else
-		log_info "Generating docker-compose.yaml based on model list: ${models_file}"
-
-		# 生成CUSTOM_MODELS内容
-		local custom_models_content
-		custom_models_content=$(generate_custom_models_list "${models_file}")
-
-		if [[ -z ${custom_models_content} ]]; then
-			log_warning "未找到激活的模型，将生成默认配置"
-			custom_models_content="-all"
-		fi
-
-		# 自动检测默认模型
-		local default_model
-		default_model=$(detect_default_model "${models_file}")
-
-		# 检查是否有可用的模型 (CUSTOM_MODELS只有-all说明没有激活的模型)
-		if [[ ${custom_models_content} == "-all" ]]; then
-			log_error "错误: models.list 中没有找到可用的模型配置"
-			log_error "请确保 models.list 中至少有一个未被注释的模型配置"
-			return 1
-		fi
-
-		[[ -n ${VERBOSE} ]] && log_info "Generated CUSTOM_MODELS content"
-		[[ -n ${VERBOSE} ]] && log_info "Detected default model: ${default_model}"
-
-		# 生成docker-compose.yaml内容
+		log_info "Generating new docker-compose.yaml from model list: ${models_file}"
 		generate_compose_content "${output_file}" "${custom_models_content}" "${default_model}"
 	fi
 }
 
-# 生成CUSTOM_MODELS列表
-generate_custom_models_list() {
+# Parse models file and generate both custom models list and default model
+parse_models_configuration() {
 	local models_file="$1"
-	local custom_models_entries=()
+	local -n custom_models_ref=$2
+	local -n default_model_ref=$3
 
-	# 添加 -all 作为第一个条目（隐藏所有默认模型）
-	custom_models_entries+=("-all")
+	# Use existing parse_models_list function to get validated model entries
+	# Suppress verbose logging during compose generation
+	local models_array=()
+	local was_suppressed="${_LOG_SUPPRESSED}"
+	suppress_logging
+	local parse_result
+	parse_models_list "${models_file}" models_array
+	parse_result=$?
+	[[ ${was_suppressed} != "true" ]] && restore_logging
 
-	while IFS= read -r line || [[ -n ${line} ]]; do
-		# 跳过注释行和空行
-		[[ ${line} =~ ^[[:space:]]*# ]] && continue
-		[[ -z ${line// /} ]] && continue
+	if [[ ${parse_result} -ne 0 ]]; then
+		custom_models_ref=""
+		default_model_ref="qwen3-14b"
+		return 1
+	fi
 
-		# 解析行内容
-		read -r model_type model_spec _ <<<"${line}"
+	local custom_models_entries=("-all") # Start with -all to hide default models
+	local first_active_model=""
 
-		case "${model_type}" in
-		"ollama")
-			if [[ -n ${model_spec} ]]; then
-				local alias
-				alias=$(generate_model_alias "${model_spec}" "ollama")
-				local entry="+${model_spec}@OpenAI=${alias}"
-				custom_models_entries+=("${entry}")
-			fi
-			;;
-		"hf-gguf")
-			if [[ -n ${model_spec} ]]; then
-				local alias
-				alias=$(generate_model_alias "${model_spec}" "hf-gguf")
-				local entry="+${model_spec}@OpenAI=${alias}"
-				custom_models_entries+=("${entry}")
-			fi
-			;;
-		*)
-			# 忽略未知的模型类型
-			;;
-		esac
-	done <"${models_file}"
+	# Process each validated model entry
+	for model_entry in "${models_array[@]}"; do
+		local -A model_info
+		if parse_model_entry "${model_entry}" model_info; then
+			# Generate alias and custom model entry
+			local model_spec="${model_info[name]}:${model_info[tag]}"
+			local alias
+			alias=$(generate_model_alias "${model_spec}" "${model_info[type]}")
+			custom_models_entries+=("+${model_spec}@OpenAI=${alias}")
 
-	# 输出CUSTOM_MODELS格式
+			# Set first active model as default if not set
+			[[ -z ${first_active_model} ]] && first_active_model="${alias}"
+		fi
+	done
+
+	# Generate custom models output
 	if [[ ${#custom_models_entries[@]} -gt 1 ]]; then
-		printf '%s' "${custom_models_entries[0]}"
+		custom_models_ref="${custom_models_entries[0]}"
 		for ((i = 1; i < ${#custom_models_entries[@]}; i++)); do
-			printf ',\\\n        %s' "${custom_models_entries[i]}"
+			custom_models_ref+=",\\
+        ${custom_models_entries[i]}"
 		done
 	else
-		echo "-all"
+		custom_models_ref="" # No active models found
 	fi
+
+	# Set default model (passed by reference)
+	# shellcheck disable=SC2034
+	default_model_ref="${first_active_model:-qwen3-14b}"
 }
 
 # 生成简单的模型别名
@@ -2311,42 +2277,7 @@ generate_model_alias() {
 	fi
 }
 
-# 检测默认模型
-detect_default_model() {
-	local models_file="$1"
-	local first_active_model=""
-
-	while IFS= read -r line || [[ -n ${line} ]]; do
-		# 跳过注释行和空行
-		[[ ${line} =~ ^[[:space:]]*# ]] && continue
-		[[ -z ${line// /} ]] && continue
-
-		# 解析行内容
-		read -r model_type model_spec _ <<<"${line}"
-
-		# 找到第一个激活的模型并生成其别名
-		if [[ -n ${model_spec} && -z ${first_active_model} ]]; then
-			case "${model_type}" in
-			"ollama")
-				first_active_model=$(generate_model_alias "${model_spec}" "ollama")
-				break
-				;;
-			"hf-gguf")
-				first_active_model=$(generate_model_alias "${model_spec}" "hf-gguf")
-				break
-				;;
-			*)
-				# 忽略未知的模型类型
-				;;
-			esac
-		fi
-	done <"${models_file}"
-
-	# 如果没有找到激活的模型，使用默认值
-	echo "${first_active_model:-qwen3-14b}"
-}
-
-# 生成docker-compose.yaml文件内容
+# Detect available GPU devices
 detect_gpus() {
 	local gpu_indices=""
 
@@ -2367,23 +2298,12 @@ generate_compose_content() {
 	local custom_models="$2"
 	local default_model="$3"
 
-	local cuda_devices
+	local cuda_devices host_timezone
 	cuda_devices=$(detect_gpus)
-
-	# 获取主机时区
-	local host_timezone
 	host_timezone=$(get_host_timezone)
 	[[ -z ${host_timezone} ]] && host_timezone="UTC"
 
-	# 如果文件已存在，创建备份
-	if [[ -f ${output_file} ]]; then
-		local backup_file
-		backup_file="${output_file}.backup.$(date +%Y%m%d_%H%M%S)"
-		cp "${output_file}" "${backup_file}"
-		log_info "已备份所有文件: ${backup_file}"
-	fi
-
-	# 生成docker-compose.yaml内容
+	# Generate docker-compose.yaml content
 	cat >"${output_file}" <<EOF
 services:
   ollama:
@@ -2396,13 +2316,13 @@ services:
     networks:
       - llms-tools-network
     environment:
-      # Ollama优化配置
-      - CUDA_VISIBLE_DEVICES=${cuda_devices} # 自动检测并使用所有可用GPU
-      - OLLAMA_NEW_ENGINE=1 # 新的引擎, ollamarunner
-      - OLLAMA_SCHED_SPREAD=1 # 启用多GPU负载均衡
-      - OLLAMA_KEEP_ALIVE=5m # 模型在内存中保持加载的时长, 分钟
-      - OLLAMA_NUM_PARALLEL=3 # 并发请求数
-      - OLLAMA_FLASH_ATTENTION=1 # flash attention, 用于优化注意力计算, 降低显存使用
+      # Ollama optimization configuration
+      - CUDA_VISIBLE_DEVICES=${cuda_devices} # Auto-detect and use all available GPUs
+      - OLLAMA_NEW_ENGINE=1 # New engine, ollamarunner
+      - OLLAMA_SCHED_SPREAD=1 # Enable multi-GPU load balancing
+      - OLLAMA_KEEP_ALIVE=5m # Model keep-alive duration in memory, minutes
+      - OLLAMA_NUM_PARALLEL=3 # Number of concurrent requests
+      - OLLAMA_FLASH_ATTENTION=1 # Flash attention for optimized attention computation, reducing VRAM usage
     deploy:
       resources:
         reservations:
@@ -2436,11 +2356,11 @@ services:
     ports:
       - "8501:80"
     environment:
-      - VITE_CUSTOM_API_BASE_URL=http://YOUR_SERVER_IP:3001/v1  # 修改为你的服务器IP地址
-      - VITE_CUSTOM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 修改为你的API密钥
-      - VITE_CUSTOM_API_MODEL=${default_model}  # 自动设置为models.list第一个模型
-      - ACCESS_USERNAME=admin  # 修改为你的用户名
-      - ACCESS_PASSWORD=xxxxxxxxxxxxxxxxxxxxxx  # 修改为你的密码
+      - VITE_CUSTOM_API_BASE_URL=http://YOUR_SERVER_IP:3001/v1  # Replace with your server IP
+      - VITE_CUSTOM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # Replace with your API key
+      - VITE_CUSTOM_API_MODEL=${default_model}  # Auto-set to first model from models.list
+      - ACCESS_USERNAME=admin  # Replace with your username
+      - ACCESS_PASSWORD=xxxxxxxxxxxxxxxxxxxxxx  # Replace with your password
     networks:
       - llms-tools-network
     depends_on:
@@ -2453,12 +2373,12 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # 修改为你的OpenAI API密钥
+      - OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # Replace with your OpenAI API key
       - BASE_URL=http://one-api:3001
       - PROXY_URL=
       - "CUSTOM_MODELS=${custom_models}"
-      - DEFAULT_MODEL=${default_model}  # 自动设置为models.list第一个模型
-      - CODE=xxxxxxxxxxxxxxxxxxxxxx  # 修改为你的访问密码
+      - DEFAULT_MODEL=${default_model}  # Auto-set to first model from models.list
+      - CODE=xxxxxxxxxxxxxxxxxxxxxx  # Replace with your access password
     networks:
       - llms-tools-network
     depends_on:
@@ -2473,30 +2393,30 @@ networks:
         - subnet: 172.28.28.0/24
 EOF
 
-	log_success "成功生成docker-compose.yaml文件: ${output_file}"
-	log_info "包含模型配置: ${custom_models}"
-	log_info "默认模型: ${default_model}"
-	log_info "检测到GPU设备: ${cuda_devices}"
+	log_success "Successfully generated docker-compose.yaml: ${output_file}"
+	log_verbose "Model configuration: ${custom_models}"
+	log_verbose "Default model: ${default_model}"
+	log_verbose "Detected GPU devices: ${cuda_devices}"
 	echo ""
-	log_info "⚠️  重要提示: 生成的配置文件中包含占位符，请根据以下说明修改："
-	log_info "== 必须修改的配置 =="
-	log_info "1. VITE_CUSTOM_API_BASE_URL: 将 YOUR_SERVER_IP 替换为实际服务器IP地址"
-	log_info "2. VITE_CUSTOM_API_KEY: 替换为 one-api 中的有效API密钥"
-	log_info "3. ACCESS_USERNAME/ACCESS_PASSWORD: 设置 prompt-optimizer 的登录凭据"
-	log_info "4. OPENAI_API_KEY: 替换为 one-api 中的有效API密钥"
-	log_info "5. CODE: 设置 ChatGPT-Next-Web 的访问密码"
-	log_info "6. VITE_CUSTOM_API_MODEL/DEFAULT_MODEL: 已自动设置为 ${default_model}，可根据需要修改"
+	log_info "⚠️  Important: The generated configuration contains placeholders that require modification:"
+	log_info "== Required Configuration Changes =="
+	log_info "1. VITE_CUSTOM_API_BASE_URL: Replace YOUR_SERVER_IP with actual server IP"
+	log_info "2. VITE_CUSTOM_API_KEY: Replace with valid API key from one-api"
+	log_info "3. ACCESS_USERNAME/ACCESS_PASSWORD: Set login credentials for prompt-optimizer"
+	log_info "4. OPENAI_API_KEY: Replace with valid API key from one-api"
+	log_info "5. CODE: Set access password for ChatGPT-Next-Web"
+	log_info "6. VITE_CUSTOM_API_MODEL/DEFAULT_MODEL: Auto-set to ${default_model}, modify as needed"
 	echo ""
-	log_info "== 可选修改的配置 =="
-	log_info "• 端口映射: 如需避免端口冲突，可修改 ports 部分的主机端口"
-	log_info "  - Ollama: 11434 -> 自定义端口"
-	log_info "  - One-API: 3001 -> 自定义端口"
-	log_info "  - Prompt-Optimizer: 8501 -> 自定义端口"
-	log_info "  - ChatGPT-Next-Web: 3000 -> 自定义端口"
-	log_info "• Docker镜像: 如需使用特定版本，可修改 image 部分的标签"
-	log_info "• 网络配置: 可修改 subnet 以避免IP地址冲突"
+	log_info "== Optional Configuration Changes =="
+	log_info "• Port mappings: Modify host ports to avoid conflicts"
+	log_info "  - Ollama: 11434 -> custom port"
+	log_info "  - One-API: 3001 -> custom port"
+	log_info "  - Prompt-Optimizer: 8501 -> custom port"
+	log_info "  - ChatGPT-Next-Web: 3000 -> custom port"
+	log_info "• Docker images: Modify image tags to use specific versions"
+	log_info "• Network configuration: Modify subnet to avoid IP conflicts"
 	echo ""
-	log_info "配置完成后运行: docker compose up -d 来启动服务"
+	log_info "After configuration, run: docker compose up -d"
 
 	return 0
 }
@@ -2525,12 +2445,6 @@ check_dependencies() {
 			log_error "Docker is installed but daemon is not running, please start Docker service"
 			return 1
 		fi
-	fi
-
-	# 检查 tar
-	if ! command_exists tar; then
-		missing_deps+=("tar")
-		log_error "tar not installed, required for model file packing/unpacking"
 	fi
 
 	# 如果有缺失的依赖，给出提示并退出
