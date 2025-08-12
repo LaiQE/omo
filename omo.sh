@@ -189,6 +189,32 @@ format_bytes() {
     }'
 }
 
+# 计算目录大小（避免du依赖）
+calculate_directory_size() {
+	local directory="$1"
+
+	if [[ ! -d ${directory} ]]; then
+		echo "0"
+		return 1
+	fi
+
+	local total_size_bytes=0
+	while IFS= read -r -d '' file; do
+		if [[ -f ${file} ]]; then
+			local file_size
+			# 使用POSIX兼容的方式获取文件大小
+			if command_exists stat; then
+				file_size=$(stat -f%z "${file}" 2>/dev/null || stat -c%s "${file}" 2>/dev/null || echo "0")
+			else
+				file_size=$(wc -c <"${file}" 2>/dev/null || echo "0")
+			fi
+			total_size_bytes=$((total_size_bytes + file_size))
+		fi
+	done < <(find "${directory}" -type f -print0 2>/dev/null)
+
+	echo "${total_size_bytes}"
+}
+
 # 计算目录的MD5校验值
 calculate_directory_md5() {
 	local dir_path="$1"
@@ -1351,127 +1377,88 @@ backup_single_model() {
 
 # 自动识别备份类型并恢复
 # 批量备份模型（根据models.list文件）
-
 backup_models_from_list() {
 	local models_file="$1"
 
-	log_verbose "批量备份模型..."
-	log_verbose "模型列表文件: ${models_file}"
-	log_verbose "备份目录: ${BACKUP_OUTPUT_DIR}"
+	log_verbose "Batch backup models..."
+	log_verbose "Models list file: ${models_file}"
+	log_verbose "Backup directory: ${BACKUP_OUTPUT_DIR}"
 
 	# 解析模型列表
 	local models=()
 	parse_models_list "${models_file}" models
 
 	if [[ ${#models[@]} -eq 0 ]]; then
-		log_warning "没有找到任何模型进行备份"
+		log_warning "No models found for backup"
 		return 1
 	fi
 
 	# 创建备份目录
 	mkdir -p "${BACKUP_OUTPUT_DIR}"
 
-	local total_models=${#models[@]}
-	local processed=0
-	local success=0
-	local failed=0
+	local -i total_models=${#models[@]} processed=0 success=0 failed=0
 
-	log_verbose "共找到 ${total_models} 个模型进行备份"
+	log_verbose "Found ${total_models} models for backup"
 
-	# 预先初始化Ollama缓存，避免每个模型都重新初始化
-	local has_ollama_models=false
-	for model in "${models[@]}"; do
-		if [[ ${model} =~ ^ollama: ]] || [[ ${model} =~ ^hf-gguf: ]]; then
-			has_ollama_models=true
-			break
-		fi
-	done
-
-	if [[ ${has_ollama_models} == "true" ]]; then
-		log_verbose "检测到Ollama模型，预先初始化模型缓存..."
-		if ! init_ollama_cache; then
-			log_error "Ollama缓存初始化失败，可能影响备份性能"
-		fi
+	# 预先初始化Ollama缓存以提高性能
+	log_verbose "Pre-initializing Ollama cache..."
+	if ! init_ollama_cache; then
+		log_error "Ollama cache initialization failed, may affect backup performance"
 	fi
+
+	# 处理单个模型的内部函数
+	_process_backup_entry() {
+		local model="$1"
+		local -A model_info
+
+		if ! parse_model_entry "${model}" model_info; then
+			log_error "Invalid model entry format: ${model}"
+			return 1
+		fi
+
+		if ! check_model_exists model_info; then
+			log_warning "Model does not exist: ${model_info[display]}"
+			return 1
+		fi
+
+		backup_single_model model_info
+	}
 
 	for model in "${models[@]}"; do
 		((processed++))
-		log_info "备份模型 [${processed}/${total_models}]: ${model}"
+		log_info "Backing up model [${processed}/${total_models}]: ${model}"
 
-		# 解析模型条目
-		if [[ ${model} =~ ^ollama:([^:]+):(.+)$ ]]; then
-			local model_name="${BASH_REMATCH[1]}"
-			local model_tag="${BASH_REMATCH[2]}"
-
-			# 检查模型是否存在
-			if check_ollama_model "${model_name}" "${model_tag}"; then
-				if backup_ollama_model "${model_name}" "${model_tag}"; then
-					((success++))
-				else
-					((failed++))
-				fi
-			else
-				((failed++))
-			fi
-
-		elif [[ ${model} =~ ^hf-gguf:(.+)$ ]]; then
-			local model_full_name="${BASH_REMATCH[1]}"
-
-			# 解析HuggingFace GGUF模型名称
-			if [[ ${model_full_name} =~ ^(.+):(.+)$ ]]; then
-				local model_name="${BASH_REMATCH[1]}"
-				local model_tag="${BASH_REMATCH[2]}"
-			else
-				local model_name="${model_full_name}"
-				local model_tag="latest"
-			fi
-
-			# 检查HF GGUF模型是否存在
-			if check_ollama_model "${model_name}" "${model_tag}"; then
-				if backup_ollama_model "${model_name}" "${model_tag}"; then
-					((success++))
-				else
-					((failed++))
-				fi
-			else
-				((failed++))
-			fi
-
+		if _process_backup_entry "${model}"; then
+			((success++))
 		else
-			log_error "无效的模型条目格式: ${model}"
 			((failed++))
 		fi
 
 		echo "" # 添加空行分隔
 	done
 
-	# 显示备份总结
-	log_verbose_success "批量备份完成 (${success}/${total_models})"
-	if [[ ${failed} -gt 0 ]]; then
-		log_warning "备份失败: ${failed}"
-		return 1
+	# 清理完整性检查缓存
+	if [[ -n ${VERBOSE} ]]; then
+		log_verbose "Clearing integrity check cache"
+		unset BACKUP_CONTENT_CACHE
+		declare -g -A BACKUP_CONTENT_CACHE
 	fi
 
 	# 显示备份目录信息
-	if [[ ${VERBOSE} == "true" ]] && [[ -d ${backup_dir} ]]; then
-		# 只统计顶级模型目录，排除子目录
-		local backup_count
-		backup_count=$(find "${backup_dir}" -maxdepth 1 -type d ! -path "${backup_dir}" | wc -l)
-		local total_size
-		total_size=$(du -sh "${backup_dir}" 2>/dev/null | cut -f1)
-		log_info "备份目录下共有: ${backup_count} 个模型，总大小: ${total_size}"
+	if [[ ${VERBOSE} == "true" && -d ${BACKUP_OUTPUT_DIR} ]]; then
+		local backup_count total_size_bytes total_size
+		backup_count=$(find "${BACKUP_OUTPUT_DIR}" -maxdepth 1 -type d ! -path "${BACKUP_OUTPUT_DIR}" | wc -l)
+		total_size_bytes=$(calculate_directory_size "${BACKUP_OUTPUT_DIR}")
+		total_size=$(format_bytes "${total_size_bytes}")
+		log_info "Backup directory contains: ${backup_count} models, total size: ${total_size}"
 	fi
 
-	# 清理完整性检查缓存
-	[[ -n ${VERBOSE} ]] && log_verbose "Clearing integrity check cache"
-	unset BACKUP_CONTENT_CACHE
-	declare -g -A BACKUP_CONTENT_CACHE
-
+	# 显示备份总结并返回结果
 	if [[ ${failed} -eq 0 ]]; then
-		log_verbose_success "全部模型备份完成"
+		log_verbose_success "All models backup completed (${success}/${total_models})"
 		return 0
 	else
-		log_warning "部分模型备份失败"
+		log_warning "Backup completed with failures: ${success} succeeded, ${failed} failed"
 		return 1
 	fi
 }
@@ -1480,7 +1467,7 @@ backup_models_from_list() {
 create_backup_info() {
 	local model_spec="$1"
 	local backup_base="$2"
-	local backup_type="$3"   # "directory", "single" 或 "split"
+	local backup_type="$3"   # "directory", "single" or "split"
 	local _volume_count="$4" # Reserved for future use
 	local backup_extension="${5:-original}"
 
@@ -1490,168 +1477,130 @@ create_backup_info() {
 	local model_safe_name
 	model_safe_name=$(get_safe_model_name "${model_spec}")
 
-	# 使用临时文件创建备份信息
+	# Use temporary file to create backup information
 	local temp_info
 	temp_info=$(mktemp)
 	cat >"${temp_info}" <<EOF
 ================================================================================
-                           模型备份信息
+                        Model Backup Information
 ================================================================================
 
-备份基本信息:
-  模型规格: ${model_spec}
-  备份名称: ${model_safe_name}
-  备份类型: ${backup_type}
-  创建时间: ${current_time}
+Basic Backup Information:
+  Model Specification: ${model_spec}
+  Backup Name: ${model_safe_name}
+  Backup Type: ${backup_type}
+  Creation Time: ${current_time}
 
-备份文件信息:
+Backup File Information:
 EOF
 
-	# 根据备份类型添加具体的文件信息和MD5
+	# Add specific file information and MD5 based on backup type
 	if [[ ${backup_type} == "directory" ]]; then
 		local backup_dir="${backup_base}_${backup_extension}"
-		# 对于ollama备份，backup_base已经是完整路径，不需要添加后缀
+		# For ollama backups, backup_base is already the complete path
 		if [[ ${backup_extension} == "ollama" ]]; then
 			backup_dir="${backup_base}"
 		fi
-		local backup_size="未知"
-		if [[ -d ${backup_dir} ]]; then
-			local total_bytes=0
-			# 使用find和ls计算目录总大小
-			while IFS= read -r -d '' file; do
-				if [[ -f ${file} ]]; then
-					local file_size
-					file_size=$(ls -l "${file}" 2>/dev/null | awk '{print $5}' || echo "0")
-					total_bytes=$((total_bytes + file_size))
-				fi
-			done < <(find "${backup_dir}" -type f -print0 2>/dev/null || true)
 
+		local backup_size="Unknown"
+		if [[ -d ${backup_dir} ]]; then
+			local total_bytes
+			total_bytes=$(calculate_directory_size "${backup_dir}")
 			if [[ ${total_bytes} -gt 0 ]]; then
 				backup_size=$(format_bytes "${total_bytes}")
 			fi
 		fi
 		local md5_file="${backup_dir}.md5"
-		local md5_status="有效"
-
+		local md5_status="Valid"
 		if [[ ! -f ${md5_file} ]]; then
-			md5_status="缺失"
+			md5_status="Missing"
 		fi
 
 		cat >>"${temp_info}" <<EOF
-  备份方式: 目录复制
-  备份目录: $(basename "${backup_dir}")
-  备份大小: ${backup_size}
-  MD5校验文件: ${md5_status}
+  Backup Method: Directory Copy
+  Backup Directory: $(basename "${backup_dir}")
+  Backup Size: ${backup_size}
+  MD5 Checksum File: ${md5_status}
 
-文件列表:
+File List:
 EOF
 
-		# 添加文件列表
+		# Add file list
 		if [[ -d ${backup_dir} ]]; then
 			find "${backup_dir}" -type f -exec basename {} \; | sort >>"${temp_info}"
 		fi
 
 		cat >>"${temp_info}" <<EOF
 
-MD5校验信息:
+MD5 Checksum Information:
 EOF
 
-		# 添加MD5校验信息
+		# Add MD5 checksum information
 		if [[ -f ${md5_file} ]]; then
 			cat "${md5_file}" >>"${temp_info}"
 		else
 			{
-				echo "  MD5校验文件创建失败或不存在"
-				echo "  文件路径: ${md5_file}"
-				echo "  建议: 重新运行备份以生成MD5校验文件"
+				echo "  MD5 checksum file creation failed or does not exist"
+				echo "  File path: ${md5_file}"
+				echo "  Recommendation: Re-run backup to generate MD5 checksum file"
 			} >>"${temp_info}"
 		fi
 
 		cat >>"${temp_info}" <<EOF
 
-恢复命令:
-  # 使用omo.sh恢复
+Restore Commands:
+  # Using omo.sh restore
   ./omo.sh --restore "$(basename "${backup_dir}")"
   
-  # 手动恢复（Ollama模型）
+  # Manual restore (Ollama models)
   cp -r "$(basename "${backup_dir}")/manifests/"* "\$OLLAMA_MODELS_DIR/manifests/"
   cp "$(basename "${backup_dir}")/blobs/"* "\$OLLAMA_MODELS_DIR/blobs/"
   
 
 EOF
 	else
-		log_error "不支持的备份类型: ${backup_type}"
+		log_error "Unsupported backup type: ${backup_type}"
 		rm -f "${temp_info}"
 		return 1
 	fi
 
 	cat >>"${temp_info}" <<EOF
 ================================================================================
-                               验证信息
+                            Verification Information
 ================================================================================
 
-备份验证:
-1. 检查文件完整性:
-   - 使用MD5校验文件验证每个文件的完整性
+Backup Verification:
+1. Check file integrity:
+   - Use MD5 checksum file to verify integrity of each file
    - md5sum -c $(basename "${backup_dir}.md5")
 
-2. 检查备份结构:
-   - 确保备份目录包含完整的文件结构
-   - 对于Ollama模型: manifests/ 和 blobs/ 目录
+2. Check backup structure:
+   - Ensure backup directory contains complete file structure
+   - For Ollama models: manifests/ and blobs/ directories
 
-备份特性:
-   - 直接复制: 极快的备份和恢复速度，无需压缩/解压缩
-   - MD5校验: 确保文件完整性和一致性
-   - 简化管理: 备份文件可直接访问和检查
+Backup Features:
+   - Direct Copy: Extremely fast backup and restore speed, no compression/decompression needed
+   - MD5 Checksums: Ensures file integrity and consistency
+   - Simplified Management: Backup files can be directly accessed and inspected
 
-使用说明:
-- 此备份包含模型的完整文件结构
-- 恢复后可直接使用，无需额外处理
-- 支持增量备份和差异检查
+Usage Instructions:
+- This backup contains the complete file structure of the model
+- Can be used directly after restoration, no additional processing required
+- Supports incremental backup and difference checking
 
-生成时间: ${current_time}
+Generated Time: ${current_time}
 ================================================================================
 EOF
 
-	# 直接写入信息文件
+	# Write to info file directly
 	if mv "${temp_info}" "${info_file}"; then
-		# 设置备份信息文件权限为644
-		chmod 644 "${info_file}" || log_warning "设置备份信息文件权限失败"
+		# Set backup info file permissions to 644
+		chmod 644 "${info_file}" || log_warning "Failed to set backup info file permissions"
 		log_verbose_success "Backup info file created: $(basename "${info_file}")"
 	else
 		log_error "Unable to write backup info file: ${info_file}"
 		rm -f "${temp_info}"
 		return 1
-	fi
-}
-
-# 恢复模型的统一入口函数（从文件路径恢复）
-
-remove_incomplete_backup() {
-	local backup_base="$1"
-	local backup_suffix="${2-}"
-
-	log_verbose "Deleting incomplete backup: ${backup_base}${backup_suffix}"
-
-	# 删除目录备份
-	local backup_dir="${backup_base}${backup_suffix}"
-	if [[ -d ${backup_dir} ]]; then
-		rm -rf "${backup_dir}"
-		log_verbose "Backup directory deleted: ${backup_dir}"
-	fi
-
-	# 删除MD5校验文件
-	local md5_file="${backup_dir}.md5"
-	if [[ -f ${md5_file} ]]; then
-		rm -f "${md5_file}"
-		log_verbose "MD5 checksum file deleted: ${md5_file}"
-	fi
-
-	# 删除备份信息文件
-	local info_file="${backup_base}${backup_suffix}_info.txt"
-	if [[ -f ${info_file} ]]; then
-		rm -f "${info_file}"
-		log_verbose "Backup info file deleted: ${info_file}"
 	fi
 }
 
