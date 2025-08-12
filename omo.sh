@@ -522,8 +522,11 @@ parse_model_entry() {
 	local model_entry="$1"
 	local -n result_ref="$2"
 
-	# 清空结果数组
-	result_ref=()
+	# 初始化结果关联数组
+	result_ref[type]=""
+	result_ref[name]=""
+	result_ref[tag]=""
+	result_ref[display]=""
 
 	if [[ ${model_entry} =~ ^ollama:([^:]+):(.+)$ ]]; then
 		result_ref[type]="ollama"
@@ -578,7 +581,7 @@ parse_models_list() {
 			fi
 
 			# 使用parse_model_entry验证条目格式
-			local model_info
+			local -A model_info
 			if parse_model_entry "${model_entry}" model_info; then
 				models_array+=("${model_entry}")
 				log_verbose "Added model: ${model_info[display]}"
@@ -1175,9 +1178,55 @@ download_ollama_model() {
 	fi
 }
 
-# ===== 备份工具函数 =====
+process_model() {
+	local model_entry="$1"
+	local force_download="$2"
+	local check_only="$3"
 
-# 通用命令检查函数
+	# 解析模型条目
+	local -A model_info
+	if ! parse_model_entry "${model_entry}" model_info; then
+		log_error "Invalid model entry format: ${model_entry}"
+		return 1
+	fi
+
+	log_info "Processing model: ${model_info[display]}"
+
+	# 检查模型是否存在
+	if [[ ${force_download} != "true" ]] && check_model_exists model_info; then
+		log_success "Model already exists"
+		return 0
+	fi
+
+	# 模型不存在或强制下载
+	if [[ ${check_only} == "true" ]]; then
+		log_warning "Download needed: ${model_info[display]}"
+		return 0
+	fi
+
+	# 清理缓存的辅助函数
+	_clear_ollama_cache() {
+		OLLAMA_CACHE_INITIALIZED="false"
+		OLLAMA_MODELS_CACHE=""
+	}
+
+	# 尝试从备份恢复
+	if try_restore_model model_info; then
+		log_success "Successfully restored from backup"
+		_clear_ollama_cache
+		return 0
+	fi
+
+	# 执行下载
+	if download_model model_info; then
+		log_success "Model download completed"
+		_clear_ollama_cache
+		return 0
+	else
+		log_error "Model processing failed: ${model_info[display]}"
+		return 1
+	fi
+}
 
 #=============================================
 # 11. 模型备份模块 (Model Backup)
@@ -2210,58 +2259,6 @@ Ollama模型备份:
 
 EOF
 }
-
-# 检查依赖
-# 检查GPU支持
-
-process_model() {
-	local model_entry="$1"
-	local force_download="$2"
-	local check_only="$3"
-
-	# 解析模型条目
-	local -A model_info
-	if ! parse_model_entry "${model_entry}" model_info; then
-		log_error "无效的模型条目格式: ${model_entry}"
-		return 1
-	fi
-
-	log_verbose "处理模型: ${model_info[display]}"
-
-	# 检查模型是否存在
-	if [[ ${force_download} != "true" ]] && check_model_exists model_info; then
-		log_success "模型已存在"
-		return 0
-	fi
-
-	# 模型不存在或强制下载
-	if [[ ${check_only} == "true" ]]; then
-		log_warning "需要下载: ${model_info[display]}"
-		return 0
-	fi
-
-	# 尝试从备份恢复
-	if try_restore_model model_info; then
-		log_success "从备份恢复成功"
-		# 清除缓存，强制重新检查
-		OLLAMA_CACHE_INITIALIZED="false"
-		OLLAMA_MODELS_CACHE=""
-		return 0
-	fi
-
-	# 执行下载
-	if download_model model_info; then
-		log_success "模型下载完成"
-		# 清除缓存，强制重新检查
-		OLLAMA_CACHE_INITIALIZED="false"
-		OLLAMA_MODELS_CACHE=""
-		return 0
-	else
-		log_error "模型处理失败: ${model_info[display]}"
-		return 1
-	fi
-}
-
 # 主函数
 
 main() {
