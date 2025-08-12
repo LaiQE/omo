@@ -1628,8 +1628,8 @@ restore_model() {
 		return 1
 	fi
 
-	# 分发到具体的恢复实现
-	_restore_by_type "ollama" "${restore_path}" "${force_restore}"
+	# 直接调用Ollama恢复实现（使用Docker进行文件操作）
+	_restore_ollama_implementation "${restore_path}" "${force_restore}"
 }
 
 # 尝试从备份自动恢复模型（从模型信息恢复）
@@ -1637,32 +1637,23 @@ restore_model() {
 try_restore_model() {
 	local -n model_info_ref=$1
 
-	case "${model_info_ref[type]}" in
-	"ollama" | "hf-gguf")
-		_auto_restore_from_backup "${model_info_ref[type]}" "${model_info_ref[name]}" "${model_info_ref[tag]}"
-		;;
-	*)
-		log_error "Unsupported model type for restore: ${model_info_ref[type]}"
-		return 1
-		;;
-	esac
+	# 所有模型类型都使用相同的Ollama恢复机制
+	_auto_restore_from_backup "${model_info_ref[name]}" "${model_info_ref[tag]}"
 }
 
 # 内部函数：自动恢复实现
 
 _auto_restore_from_backup() {
-	local model_type="$1"
-	local model_name="$2"
-	local model_tag="$3"
+	local model_name="$1"
+	local model_tag="$2"
 	local model_spec="${model_name}:${model_tag}"
 
 	log_verbose "Checking for model backup: ${model_spec}"
 
-	# 获取备份路径
+	# 获取备份路径并验证
 	local backup_model_dir
 	backup_model_dir=$(get_model_backup_path "${model_name}" "${model_tag}")
 
-	# 检查备份是否存在
 	if [[ ! -d ${backup_model_dir} ]]; then
 		log_verbose "No backup found: ${backup_model_dir}"
 		return 1
@@ -1671,32 +1662,14 @@ _auto_restore_from_backup() {
 	log_verbose_success "Found model backup: ${backup_model_dir}"
 	log_verbose "Restoring model from backup..."
 
-	# 调用统一的恢复实现
-	if _restore_by_type "${model_type}" "${backup_model_dir}" "true"; then
+	# 直接调用Ollama恢复实现（force=true以允许覆盖）
+	if _restore_ollama_implementation "${backup_model_dir}" "true"; then
 		log_success "Successfully restored model from backup: ${model_spec}"
 		return 0
 	else
 		log_warning "Failed to restore model from backup"
 		return 1
 	fi
-}
-
-# 内部函数：按类型分发恢复（统一接口）
-
-_restore_by_type() {
-	local model_type="$1"
-	local backup_path="$2"
-	local force_restore="${3:-false}"
-
-	case "${model_type}" in
-	"ollama" | "hf-gguf")
-		_restore_ollama_implementation "${backup_path}" "${force_restore}"
-		;;
-	*)
-		log_error "Unsupported model type for restore: ${model_type}"
-		return 1
-		;;
-	esac
 }
 
 # 内部函数：Ollama模型恢复的核心实现
@@ -1707,25 +1680,11 @@ _restore_ollama_implementation() {
 
 	log_info "Restoring model: $(basename "${backup_dir}")"
 
-	# 验证备份结构
-	if ! _validate_backup_structure "${backup_dir}"; then
-		return 1
-	fi
-
-	# 执行完整性校验
-	if ! _verify_backup_integrity "${backup_dir}" "${force_restore}"; then
-		return 1
-	fi
-
-	# 检查文件冲突
-	if ! _check_restore_conflicts "${backup_dir}" "${force_restore}"; then
-		return 1
-	fi
-
-	# 执行文件恢复
-	if ! _perform_files_restore "${backup_dir}"; then
-		return 1
-	fi
+	# 验证备份结构、完整性、冲突检查和文件恢复的统一流程
+	_validate_backup_structure "${backup_dir}" &&
+		_verify_backup_integrity "${backup_dir}" "${force_restore}" &&
+		_check_restore_conflicts "${backup_dir}" "${force_restore}" &&
+		_perform_files_restore "${backup_dir}" || return 1
 
 	log_verbose_success "Model restore completed"
 	return 0
@@ -1741,8 +1700,20 @@ _validate_backup_structure() {
 		return 1
 	fi
 
-	if [[ ! -d "${backup_dir}/manifests" ]] || [[ ! -d "${backup_dir}/blobs" ]]; then
+	# 检查必需的子目录并验证至少有一个文件
+	local manifests_dir="${backup_dir}/manifests"
+	local blobs_dir="${backup_dir}/blobs"
+
+	if [[ ! -d ${manifests_dir} ]] || [[ ! -d ${blobs_dir} ]]; then
 		log_error "Invalid backup structure: missing manifests or blobs directory"
+		return 1
+	fi
+
+	# 优化：一次检查两个目录是否有文件
+	local has_files
+	has_files=$(find "${manifests_dir}" "${blobs_dir}" -type f -print -quit 2>/dev/null || true)
+	if [[ -z ${has_files} ]]; then
+		log_error "Backup appears to be empty: no files found in manifests or blobs"
 		return 1
 	fi
 
@@ -1787,34 +1758,81 @@ _check_restore_conflicts() {
 	fi
 
 	log_info "Checking for file conflicts..."
-	local conflicts_found=false
-
+	# More efficient conflict detection
 	for backup_subdir in manifests blobs; do
-		if find "${backup_dir}/${backup_subdir}" -type f 2>/dev/null | while read -r backup_file; do
-			local rel_path="${backup_file#"${backup_dir}/${backup_subdir}"/}"
+		while IFS= read -r -d '' backup_file; do
+			local rel_path="${backup_file#"${backup_dir}/${backup_subdir}/"}"
 			local target_file="${OLLAMA_MODELS_DIR}/${backup_subdir}/${rel_path}"
 			if [[ -f ${target_file} ]]; then
-				echo "conflict"
-				break
+				log_error "File conflicts detected, use --force to override"
+				return 1
 			fi
-		done | grep -q "conflict"; then
-			conflicts_found=true
-			break
-		fi
+		done < <(find "${backup_dir}/${backup_subdir}" -type f -print0 2>/dev/null || true)
 	done
-
-	if [[ ${conflicts_found} == "true" ]]; then
-		log_error "File conflicts detected, use --force to override"
-		return 1
-	fi
 
 	return 0
 }
 
-# 内部函数：执行文件恢复
+# Docker容器复制工具函数
+# 使用Docker容器进行文件复制操作，确保权限一致性和操作可靠性
+_docker_copy_files() {
+	local src_path="$1"
+	local dest_path="$2"
+	local operation_name="$3"
 
+	log_verbose "Using Docker to copy ${operation_name} files"
+
+	# 确定使用的容器
+	local container=""
+	if find_running_ollama_container; then
+		container="${EXISTING_OLLAMA_CONTAINER}"
+	else
+		log_verbose "Starting temporary container for file copy operation"
+		if start_temp_ollama_container; then
+			container="${TEMP_OLLAMA_CONTAINER}"
+		else
+			log_error "Unable to start Ollama container for file copy"
+			return 1
+		fi
+	fi
+
+	# 使用docker cp进行复制
+	if docker cp "${src_path}/." "${container}:${dest_path}/"; then
+		log_verbose "Docker copy completed for ${operation_name}"
+		return 0
+	else
+		log_error "Docker copy failed for ${operation_name}"
+		return 1
+	fi
+}
+
+# 内部函数：恢复单个目录（使用Docker）
+_restore_single_directory() {
+	local src_dir="$1"
+	local dest_dir="$2"
+	local dir_name="$3"
+
+	# 检查源目录是否有文件
+	local dir_contents
+	dir_contents=$(find "${src_dir}" -mindepth 1 -maxdepth 1 2>/dev/null || true)
+	if [[ ! -d ${src_dir} ]] || [[ -z ${dir_contents} ]]; then
+		log_verbose "No ${dir_name} files to restore"
+		return 0
+	fi
+
+	log_verbose "Restoring ${dir_name} using Docker..."
+	_docker_copy_files "${src_dir}" "${dest_dir}" "${dir_name}"
+}
+
+# 内部函数：执行文件恢复
 _perform_files_restore() {
 	local backup_dir="$1"
+
+	# 检查Docker可用性（统一检查）
+	if ! command_exists docker; then
+		log_error "Docker is required for model restoration but not available"
+		return 1
+	fi
 
 	# 创建目标目录
 	if ! mkdir -p "${OLLAMA_MODELS_DIR}/manifests" "${OLLAMA_MODELS_DIR}/blobs"; then
@@ -1822,19 +1840,9 @@ _perform_files_restore() {
 		return 1
 	fi
 
-	# 恢复manifest文件
-	log_verbose "Restoring model manifests..."
-	if ! cp -r "${backup_dir}/manifests/"* "${OLLAMA_MODELS_DIR}/manifests/"; then
-		log_error "Failed to restore manifest files"
-		return 1
-	fi
-
-	# 恢复blob文件
-	log_verbose "Restoring model data..."
-	if ! cp "${backup_dir}/blobs/"* "${OLLAMA_MODELS_DIR}/blobs/"; then
-		log_error "Failed to restore blob files"
-		return 1
-	fi
+	# 恢复manifest和blob文件
+	_restore_single_directory "${backup_dir}/manifests" "${OLLAMA_MODELS_DIR}/manifests" "manifest" || return 1
+	_restore_single_directory "${backup_dir}/blobs" "${OLLAMA_MODELS_DIR}/blobs" "blob" || return 1
 
 	return 0
 }
