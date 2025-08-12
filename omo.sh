@@ -261,7 +261,14 @@ verify_directory_md5() {
 		log_error "Unable to create temporary file"
 		return 1
 	}
-	trap 'rm -f "${temp_md5}"' RETURN
+
+	# 定义清理函数避免变量作用域问题
+	cleanup_temp_md5() {
+		if [[ -n "${temp_md5:-}" ]]; then
+			rm -f "${temp_md5}"
+		fi
+	}
+	trap 'cleanup_temp_md5' RETURN
 
 	# 计算并比较MD5
 	calculate_directory_md5 "${dir_path}" "${temp_md5}" || return 1
@@ -1611,6 +1618,44 @@ EOF
 #=============================================
 # 12. 模型恢复模块 (Model Restore)
 #=============================================
+#
+# 模型恢复逻辑说明：
+# 
+# 1. 恢复流程：
+#    ├── 备份结构验证 (_validate_backup_structure)
+#    │   ├── 检查备份目录存在性
+#    │   ├── 验证manifests/blobs目录结构
+#    │   └── 确认包含实际文件（非空备份）
+#    ├── 备份完整性验证 (_verify_backup_integrity) 
+#    │   ├── 检查MD5校验文件存在性
+#    │   ├── 计算当前备份目录的MD5值
+#    │   └── 对比验证文件完整性
+#    ├── 冲突检查 (_check_restore_conflicts)
+#    │   ├── 检查目标文件是否已存在
+#    │   └── 在非强制模式下防止意外覆盖
+#    └── 文件恢复 (_perform_files_restore)
+#        ├── 启动Docker容器（确保权限一致性）
+#        ├── 在容器内创建目标目录
+#        ├── 复制manifests文件到容器内Ollama目录
+#        └── 复制blobs文件到容器内Ollama目录
+#
+# 2. 恢复模式区别：
+#    ┌─────────────────┬──────────────────┬──────────────────┐
+#    │ 恢复类型        │ 自动恢复         │ 手动恢复         │
+#    ├─────────────────┼──────────────────┼──────────────────┤
+#    │ 触发方式        │ --install        │ --restore        │
+#    │ MD5验证失败     │ 严格停止恢复     │ 可用--force跳过  │
+#    │ 文件冲突        │ 自动覆盖         │ 默认阻止，可强制 │
+#    │ 失败后行为      │ 回退到下载模式   │ 直接报错退出     │
+#    └─────────────────┴──────────────────┴──────────────────┘
+#
+# 3. 安全机制：
+#    - 完整性检查：防止损坏备份的错误恢复
+#    - 冲突检测：避免意外覆盖现有模型文件
+#    - 权限管理：通过Docker容器处理文件权限问题  
+#    - 错误恢复：提供清晰的错误信息和解决建议
+#    - 详细日志：记录每个步骤的执行状态
+#
 
 restore_model() {
 	local restore_file="$1"
@@ -1662,8 +1707,8 @@ _auto_restore_from_backup() {
 	log_verbose_success "Found model backup: ${backup_model_dir}"
 	log_verbose "Restoring model from backup..."
 
-	# 直接调用Ollama恢复实现（force=true以允许覆盖）
-	if _restore_ollama_implementation "${backup_model_dir}" "true"; then
+	# 调用Ollama恢复实现（自动恢复：允许冲突覆盖，但严格执行完整性检查）
+	if _restore_ollama_implementation "${backup_model_dir}" "true" "true"; then
 		log_success "Successfully restored model from backup: ${model_spec}"
 		return 0
 	else
@@ -1677,14 +1722,43 @@ _auto_restore_from_backup() {
 _restore_ollama_implementation() {
 	local backup_dir="$1"
 	local force_restore="${2:-false}"
+	local auto_restore="${3:-false}"  # 新参数：是否为自动恢复
 
 	log_info "Restoring model: $(basename "${backup_dir}")"
 
 	# 验证备份结构、完整性、冲突检查和文件恢复的统一流程
-	_validate_backup_structure "${backup_dir}" &&
-		_verify_backup_integrity "${backup_dir}" "${force_restore}" &&
-		_check_restore_conflicts "${backup_dir}" "${force_restore}" &&
-		_perform_files_restore "${backup_dir}" || return 1
+	log_verbose "Step 1: Validating backup structure..."
+	if ! _validate_backup_structure "${backup_dir}"; then
+		log_error "Backup structure validation failed"
+		return 1
+	fi
+	log_verbose_success "Backup structure validation passed"
+
+	log_verbose "Step 2: Verifying backup integrity..."
+	# 自动恢复时不允许忽略完整性检查失败，手动恢复时允许
+	local allow_skip_integrity="true"
+	if [[ ${auto_restore} == "true" ]]; then
+		allow_skip_integrity="false"
+	fi
+	if ! _verify_backup_integrity "${backup_dir}" "${force_restore}" "${allow_skip_integrity}"; then
+		log_error "Backup integrity verification failed"
+		return 1
+	fi
+	log_verbose_success "Backup integrity verification passed"
+
+	log_verbose "Step 3: Checking restore conflicts..."
+	if ! _check_restore_conflicts "${backup_dir}" "${force_restore}"; then
+		log_error "Restore conflict check failed"
+		return 1
+	fi
+	log_verbose_success "Restore conflict check passed"
+
+	log_verbose "Step 4: Performing files restore..."
+	if ! _perform_files_restore "${backup_dir}"; then
+		log_error "Files restore failed"
+		return 1
+	fi
+	log_verbose_success "Files restore completed"
 
 	log_verbose_success "Model restore completed"
 	return 0
@@ -1725,6 +1799,7 @@ _validate_backup_structure() {
 _verify_backup_integrity() {
 	local backup_dir="$1"
 	local force_restore="$2"
+	local allow_skip_integrity="${3:-false}"  # 新参数：是否允许忽略MD5失败
 
 	local md5_file="${backup_dir}.md5"
 	if [[ ! -f ${md5_file} ]]; then
@@ -1738,10 +1813,11 @@ _verify_backup_integrity() {
 		return 0
 	else
 		log_error "Backup integrity check failed"
-		if [[ ${force_restore} == "true" ]]; then
-			log_warning "Force restore mode, continuing..."
+		if [[ ${allow_skip_integrity} == "true" && ${force_restore} == "true" ]]; then
+			log_warning "Force restore mode, ignoring integrity check failure..."
 			return 0
 		else
+			log_error "Cannot restore corrupted backup. Use --force to override (not recommended)"
 			return 1
 		fi
 	fi
@@ -1796,6 +1872,12 @@ _docker_copy_files() {
 		fi
 	fi
 
+	# 确保目标目录在容器中存在
+	if ! docker exec "${container}" mkdir -p "${dest_path}"; then
+		log_error "Failed to create target directory in container: ${dest_path}"
+		return 1
+	fi
+
 	# 使用docker cp进行复制
 	if docker cp "${src_path}/." "${container}:${dest_path}/"; then
 		log_verbose "Docker copy completed for ${operation_name}"
@@ -1840,9 +1922,9 @@ _perform_files_restore() {
 		return 1
 	fi
 
-	# 恢复manifest和blob文件
-	_restore_single_directory "${backup_dir}/manifests" "${OLLAMA_MODELS_DIR}/manifests" "manifest" || return 1
-	_restore_single_directory "${backup_dir}/blobs" "${OLLAMA_MODELS_DIR}/blobs" "blob" || return 1
+	# 恢复manifest和blob文件（使用容器内路径）
+	_restore_single_directory "${backup_dir}/manifests" "/root/.ollama/models/manifests" "manifest" || return 1
+	_restore_single_directory "${backup_dir}/blobs" "/root/.ollama/models/blobs" "blob" || return 1
 
 	return 0
 }
@@ -2070,7 +2152,7 @@ remove_models_from_list() {
 }
 
 #=============================================
-# 14. docker compose生成模块 (Docker Compose File)
+# 14. compose生成模块 (Docker Compose File)
 #=============================================
 
 # 生成docker-compose.yaml文件
