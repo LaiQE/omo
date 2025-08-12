@@ -2435,35 +2435,46 @@ check_gpu_support() {
 check_dependencies() {
 	local missing_deps=()
 
-	# 检查 docker
+	# Check Docker - the only critical external dependency
 	if ! command_exists docker; then
 		missing_deps+=("docker")
 		log_error "Docker not installed or not in PATH"
 	else
-		# 检查 Docker 守护进程是否运行
+		log_verbose "Docker found, checking daemon status..."
 		if ! docker info &>/dev/null; then
-			log_error "Docker is installed but daemon is not running, please start Docker service"
+			log_error "Docker is installed but daemon is not running"
+			log_error "Please start Docker service and try again"
 			return 1
 		fi
+		log_verbose "Docker daemon is running"
 	fi
 
-	# 如果有缺失的依赖，给出提示并退出
+	# Check for MD5 calculation capability (system-specific)
+	if ! command_exists md5sum && ! command_exists md5; then
+		log_verbose "Warning: Neither md5sum nor md5 command found, backup integrity checks may be limited"
+	fi
+
+	# Report missing critical dependencies
 	if [[ ${#missing_deps[@]} -gt 0 ]]; then
-		log_error "Missing required system dependencies: ${missing_deps[*]}"
+		log_error "Missing required dependencies: ${missing_deps[*]}"
+		log_error ""
+		log_error "Installation suggestions:"
+		log_error "  Ubuntu/Debian: sudo apt-get install docker.io"
+		log_error "  RHEL/CentOS:   sudo yum install docker"
+		log_error "  macOS:         brew install docker"
+		log_error ""
 		log_error "Please install the missing dependencies and rerun the script"
 		return 1
 	fi
 
-	# 检查GPU支持（必需项）
-	if ! check_gpu_support; then
-		log_error "No NVIDIA GPU support detected. This script requires a GPU environment."
-		log_error "Please ensure: 1) NVIDIA drivers are installed  2) nvidia-smi tool is installed"
-		return 1
+	# Check GPU support (optional)
+	if command_exists nvidia-smi && nvidia-smi &>/dev/null; then
+		log_verbose "NVIDIA GPU support detected, GPU acceleration will be enabled"
+	else
+		log_verbose "No NVIDIA GPU support detected, running in CPU-only mode"
 	fi
 
-	log_verbose "NVIDIA GPU support detected, GPU acceleration will be enabled"
-
-	# 所有依赖检查通过，静默返回
+	log_verbose "Dependency check completed successfully"
 	return 0
 }
 
@@ -2497,72 +2508,50 @@ execute_task() {
 
 show_help() {
 	cat <<'EOF'
-🤖 OMO - Oh My Ollama / Ollama Models Organizer
+🤖 OMO - Ollama Models Organizer
 
-使用方法:
+Docker-based tool for managing Ollama models with backup and compose generation.
+
+USAGE:
   ./omo.sh [OPTIONS]
 
-选项:
-  --models-file FILE    指定模型列表文件 (默认: ./models.list)
-  --ollama-dir DIR      指定Ollama数据目录 (默认: ./ollama)
-  --backup-dir DIR      备份目录 (默认: ./backups)
-  --install             安装/下载模型 (覆盖默认的仅检查行为)
-  --check-only          仅检查模型状态，不下载 (默认行为)
-  --force-download      强制重新下载所有模型 (自动启用安装模式)
-  --verbose             显示详细日志
-  --list                列出已安装的Ollama模型及详细信息
-  --backup MODEL        备份指定模型 (格式: 模型名:版本)
-  --backup-all          备份所有模型
-  --restore FILE        恢复指定备份文件
-  --remove MODEL        删除指定模型
-  --remove-all          删除所有模型
-  --force               强制操作（跳过确认）
-  --generate-compose    生成docker-compose.yaml文件（基于models.list）
-  --help                显示帮助信息
+OPTIONS:
+  --models-file FILE      Model list file (default: ./models.list)
+  --ollama-dir DIR        Ollama data directory (default: ./ollama)
+  --backup-dir DIR        Backup directory (default: ./backups)
+  --verbose               Enable verbose logging
+  --force                 Skip confirmations
+  --help                  Show this help
 
-模型列表文件格式:
+  --install               Download missing models
+  --check-only            Check status only (default)
+  --force-download        Force re-download all models
+  --list                  List installed models
+
+  --backup MODEL          Backup model (format: name:version)
+  --backup-all            Backup all models
+  --restore FILE          Restore from backup
+
+  --remove MODEL          Remove model (format: name:version)
+  --remove-all            Remove all models
+
+  --generate-compose      Generate docker-compose.yaml
+
+MODEL FORMATS:
   ollama deepseek-r1:1.5b
   hf-gguf hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
 
-下载缓存:
-  HuggingFace GGUF模型下载支持断点续传和缓存复用
-  每个模型有独立的缓存子目录
-  中断后重新运行脚本将恢复下载，完成后自动缓存
+EXAMPLES:
+  ./omo.sh --install                    # Download missing models
+  ./omo.sh --list                       # List installed models
+  ./omo.sh --backup qwen3:8b            # Backup specific model
+  ./omo.sh --generate-compose           # Generate docker-compose.yaml
 
-EOF
-	cat <<'EOF'
+DEPENDENCIES:
+  - Docker (required)
+  - nvidia-smi (optional, for GPU support)
 
-Ollama模型备份:
-  支持完整的Ollama模型备份和恢复
-  备份目录: ./backups (默认，可通过--backup-dir指定)
-  备份格式: 目录复制 (模型名/)
-  包含内容: manifest文件和所有blob数据
-  自动生成: MD5校验文件和详细信息文件
-  
-备份特性:
-  - 直接复制备份，无压缩处理，备份和恢复速度极快
-  - MD5校验确保文件完整性
-  - 每个模型独立文件夹，便于管理
-
-示例:
-  # 检查模型状态 (默认行为)
-  ./omo.sh
-  
-  # 安装/下载缺失的模型
-  ./omo.sh --install
-  
-  # 仅检查状态 (同默认行为)
-  ./omo.sh --check-only
-  
-  # 列出已安装的模型
-  ./omo.sh --list
-  
-  # 备份模型
-  ./omo.sh --backup tinyllama:latest
-  
-  # 删除模型
-  ./omo.sh --remove llama2:7b --force
-
+GitHub: https://github.com/LaiQE/omo
 EOF
 }
 # 主函数
