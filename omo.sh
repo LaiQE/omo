@@ -2508,7 +2508,7 @@ execute_task() {
 
 show_help() {
 	cat <<'EOF'
-🤖 OMO - Ollama Models Organizer
+🤖 OMO - Oh-My-Ollama or Ollama-Models-Organizer
 
 Docker-based tool for managing Ollama models with backup and compose generation.
 
@@ -2573,7 +2573,7 @@ main() {
 	LIST_MODELS="false"
 	RESTORE_FILE=""
 	GENERATE_COMPOSE="false"
-	FORCE_RESTORE="false"
+	FORCE="false" # 通用强制标志
 	REMOVE_MODEL=""
 	REMOVE_ALL="false"
 
@@ -2581,10 +2581,20 @@ main() {
 	while [[ $# -gt 0 ]]; do
 		case $1 in
 		--models-file)
+			if [[ $# -lt 2 || -z $2 ]]; then
+				log_error "--models-file requires a file path"
+				show_help
+				exit 1
+			fi
 			MODELS_FILE="$2"
 			shift 2
 			;;
 		--ollama-dir)
+			if [[ $# -lt 2 || -z $2 ]]; then
+				log_error "--ollama-dir requires a directory path"
+				show_help
+				exit 1
+			fi
 			# 处理用户指定的Ollama目录
 			local user_ollama_dir="$2"
 			user_ollama_dir="${user_ollama_dir%/}" # 移除末尾斜杠
@@ -2600,6 +2610,11 @@ main() {
 			shift 2
 			;;
 		--backup)
+			if [[ $# -lt 2 || -z $2 ]]; then
+				log_error "--backup requires a model specification"
+				show_help
+				exit 1
+			fi
 			BACKUP_MODEL="$2"
 			shift 2
 			;;
@@ -2612,10 +2627,20 @@ main() {
 			shift
 			;;
 		--restore)
+			if [[ $# -lt 2 || -z $2 ]]; then
+				log_error "--restore requires a backup file path"
+				show_help
+				exit 1
+			fi
 			RESTORE_FILE="$2"
 			shift 2
 			;;
 		--remove)
+			if [[ $# -lt 2 || -z $2 ]]; then
+				log_error "--remove requires a model specification"
+				show_help
+				exit 1
+			fi
 			REMOVE_MODEL="$2"
 			shift 2
 			;;
@@ -2624,6 +2649,11 @@ main() {
 			shift
 			;;
 		--backup-dir)
+			if [[ $# -lt 2 || -z $2 ]]; then
+				log_error "--backup-dir requires a directory path"
+				show_help
+				exit 1
+			fi
 			BACKUP_OUTPUT_DIR="$2"
 			shift 2
 			;;
@@ -2641,7 +2671,7 @@ main() {
 			shift
 			;;
 		--force)
-			FORCE_RESTORE="true"
+			FORCE="true"
 			shift
 			;;
 		--verbose)
@@ -2653,15 +2683,15 @@ main() {
 			shift
 			;;
 		*)
-			log_error "未知参数: $1"
+			log_error "Unknown parameter: $1"
 			show_help
 			exit 1
 			;;
 		esac
 	done
 
-	# 显示当前任务（简化）
-	local current_task=""
+	# 确定并显示当前任务
+	local current_task="Install/download models" # 默认任务
 	if [[ -n ${BACKUP_MODEL} ]]; then
 		current_task="Backup model: ${BACKUP_MODEL}"
 	elif [[ ${BACKUP_ALL} == "true" ]]; then
@@ -2678,8 +2708,6 @@ main() {
 		current_task="Generate Docker Compose configuration"
 	elif [[ ${CHECK_ONLY} == "true" ]]; then
 		current_task="Check model status"
-	else
-		current_task="Install/download models"
 	fi
 
 	log_info "🚀 Task: ${current_task}"
@@ -2687,58 +2715,56 @@ main() {
 	log_verbose "Ollama directory: ${OLLAMA_MODELS_DIR}"
 	[[ -n ${BACKUP_OUTPUT_DIR} ]] && log_verbose "Backup directory: ${BACKUP_OUTPUT_DIR}"
 
-	# 初始化路径
-	mkdir -p "${OLLAMA_DATA_DIR}" || {
+	# 初始化所有必要的目录
+	if ! mkdir -p "${OLLAMA_DATA_DIR}" "${OLLAMA_MODELS_DIR}" 2>/dev/null; then
 		log_error "Unable to create necessary directories"
 		return 1
-	}
+	fi
 	ABS_OLLAMA_DATA_DIR="$(realpath "${OLLAMA_DATA_DIR}")"
 
-	# 确保Ollama目录存在
-	if [[ ! -d ${OLLAMA_MODELS_DIR} ]]; then
-		log_verbose "创建Ollama模型目录..."
-		if ! mkdir -p "${OLLAMA_MODELS_DIR}" 2>/dev/null; then
-			log_warning "无法创建Ollama模型目录，某些功能可能不可用"
-		fi
-	fi
-
 	# 执行特定任务并退出
+	# shellcheck disable=SC2317  # Commands are reachable when conditions are met
 	if [[ -n ${BACKUP_MODEL} ]]; then
 		# 解析模型信息
 		local -A model_info
 		if parse_model_entry "${BACKUP_MODEL}" model_info; then
-			execute_task "model backup" backup_single_model model_info
+			execute_task "model backup" backup_single_model model_info && exit 0 || exit 1
 		else
 			log_error "Invalid model format: ${BACKUP_MODEL}"
 			exit 1
 		fi
 	elif [[ ${BACKUP_ALL} == "true" ]]; then
-		execute_task "batch backup" backup_models_from_list "${MODELS_FILE}"
+		execute_task "batch backup" backup_models_from_list "${MODELS_FILE}" && exit 0 || exit 1
 	elif [[ ${LIST_MODELS} == "true" ]]; then
-		execute_task "model list" list_installed_models
+		execute_task "model list" list_installed_models && exit 0 || exit 1
 	elif [[ ${GENERATE_COMPOSE} == "true" ]]; then
-		execute_task "Docker configuration generation" generate_docker_compose
+		execute_task "Docker configuration generation" generate_docker_compose && exit 0 || exit 1
 	elif [[ -n ${RESTORE_FILE} ]]; then
-		execute_task "model restore" restore_model "${RESTORE_FILE}" "${FORCE_RESTORE}"
+		execute_task "model restore" restore_model "${RESTORE_FILE}" "${FORCE}" && exit 0 || exit 1
 	elif [[ -n ${REMOVE_MODEL} ]]; then
-		execute_task "model removal" remove_ollama_model "${REMOVE_MODEL}" "${FORCE_RESTORE}"
+		execute_task "model removal" remove_ollama_model "${REMOVE_MODEL}" "${FORCE}" && exit 0 || exit 1
 	elif [[ ${REMOVE_ALL} == "true" ]]; then
-		execute_task "batch delete" remove_models_from_list "${MODELS_FILE}" "${FORCE_RESTORE}"
+		execute_task "batch delete" remove_models_from_list "${MODELS_FILE}" "${FORCE}" && exit 0 || exit 1
 	fi
 
-	# 检查依赖
-	check_dependencies
+	# 对于需要模型列表的操作，检查依赖和解析模型列表
+	# 不需要模型列表的操作已在上面退出
+	if ! check_dependencies; then
+		log_error "Dependency check failed"
+		exit 1
+	fi
 
 	# 解析模型列表
 	local models=()
-	parse_models_list "${MODELS_FILE}" models
-
-	if [[ ${#models[@]} -eq 0 ]]; then
-		log_warning "没有找到任何模型，退出"
-		exit 0
+	if ! parse_models_list "${MODELS_FILE}" models; then
+		log_error "Failed to parse models list from: ${MODELS_FILE}"
+		exit 1
 	fi
 
-	# HuggingFace GGUF models are downloaded directly through Ollama, no Docker images needed
+	if [[ ${#models[@]} -eq 0 ]]; then
+		log_warning "No models found, exiting"
+		exit 0
+	fi
 
 	# 处理每个模型
 	local total_models=${#models[@]}
@@ -2747,7 +2773,7 @@ main() {
 
 	for model in "${models[@]}"; do
 		processed=$((processed + 1))
-		log_verbose "处理模型 [${processed}/${total_models}]: ${model}"
+		log_verbose "Processing model [${processed}/${total_models}]: ${model}"
 
 		# 处理单个模型错误，不中断整个流程
 		if ! process_model "${model}" "${FORCE_DOWNLOAD}" "${CHECK_ONLY}"; then
@@ -2756,17 +2782,17 @@ main() {
 	done
 
 	# 显示总结
-	log_info "=== 处理完成 ==="
-	log_info "总模型数: ${total_models}"
-	log_info "已处理: ${processed}"
+	log_info "=== Processing Complete ==="
+	log_info "Total models: ${total_models}"
+	log_info "Processed: ${processed}"
 	if [[ ${failed} -gt 0 ]]; then
-		log_warning "失败: ${failed}"
+		log_warning "Failed: ${failed}"
 	else
-		log_success "全部成功完成"
+		log_success "All completed successfully"
 	fi
 
 	if [[ ${CHECK_ONLY} == "true" ]]; then
-		log_info "检查模式完成，未执行实际下载"
+		log_info "Check mode completed, no actual downloads performed"
 	fi
 }
 
