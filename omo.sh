@@ -45,8 +45,8 @@
 #
 # 📖 使用示例:
 #   ./omo.sh --install                    # 下载缺失的模型
-#   ./omo.sh --backup qwen2.5:7b-instruct # 备份特定模型
-#   ./omo.sh --restore backup.tar.gz      # 从备份恢复
+#   ./omo.sh --backup ollama:qwen2.5:7b-instruct # 备份特定模型
+#   ./omo.sh --restore qwen2.5_7b-instruct # 从备份恢复
 #   ./omo.sh --list                       # 列出已安装模型
 #   ./omo.sh --generate-compose           # 生成Docker Compose
 #
@@ -2492,14 +2492,14 @@ OPTIONS:
   --force                 Skip confirmations
   --help                  Show this help
 
-  --install               Download missing models
+  --install               Download missing models (auto-restore from backup first)
   --check-only            Check status only (default)
   --force-download        Force re-download all models
   --list                  List installed models
 
-  --backup MODEL          Backup model (format: name:version)
+  --backup MODEL          Backup model (format: type:name:version)
   --backup-all            Backup all models
-  --restore FILE          Restore from backup
+  --restore FILE          Restore from backup (manual, auto-restore preferred)
 
   --remove MODEL          Remove model (format: name:version)
   --remove-all            Remove all models
@@ -2511,9 +2511,10 @@ MODEL FORMATS:
   hf-gguf hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
 
 EXAMPLES:
-  ./omo.sh --install                    # Download missing models
+  ./omo.sh --install                    # Download missing models (auto-restore first)
   ./omo.sh --list                       # List installed models
-  ./omo.sh --backup qwen3:8b            # Backup specific model
+  ./omo.sh --backup ollama:qwen3:8b     # Backup specific model
+  ./omo.sh --backup-all                 # Backup all models
   ./omo.sh --generate-compose           # Generate docker-compose.yaml
 
 DEPENDENCIES:

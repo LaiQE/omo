@@ -26,7 +26,8 @@
 
 - **完整备份**: 包含清单和blob文件的完整模型备份
 - **完整性验证**: 备份完整性的MD5校验和验证
-- **灵活恢复**: 从备份档案恢复模型
+- **自动恢复**: `--install`会自动检查并从备份恢复，无需下载
+- **手动恢复**: 直接从备份恢复（仅在必要时使用）
 - **批量操作**: 备份或恢复多个模型
 
 ### 🐳 Docker集成
@@ -58,10 +59,12 @@ cd omo
 chmod +x omo.sh
 ```
 
-3. 创建模型列表文件：
+3. 编辑模型列表文件：
 
 ```bash
-touch models.list
+# 编辑models.list添加你需要的模型
+# 仓库中包含带有示例的模板文件
+vim models.list
 ```
 
 ### 基本使用
@@ -77,22 +80,23 @@ touch models.list
 ./omo.sh --list
 
 # 备份特定模型
-./omo.sh --backup qwen2.5:7b-instruct
+./omo.sh --backup ollama:qwen2.5:7b-instruct
 
 # 备份所有模型
 ./omo.sh --backup-all
 
-# 从备份恢复
-./omo.sh --restore /path/to/backup.tar.gz
+# 从备份恢复（手动，不推荐）
+# 注意：--install会自动检查并恢复可用的备份
+./omo.sh --restore qwen2.5_7b-instruct
 
 # 删除模型
 ./omo.sh --remove deepseek-r1:1.5b
 
+# 删除所有模型
+./omo.sh --remove-all
+
 # 生成Docker Compose
 ./omo.sh --generate-compose
-
-# 强制操作（跳过确认）
-./omo.sh --force --install
 ```
 
 ## 📝 模型配置
@@ -208,7 +212,7 @@ export VERBOSE="true"
 ./omo.sh --list
 
 # 4. 备份重要模型
-./omo.sh --backup qwen2.5:7b-instruct
+./omo.sh --backup ollama:qwen2.5:7b-instruct
 
 # 5. 生成用于部署的Docker Compose
 ./omo.sh --generate-compose
@@ -220,14 +224,18 @@ docker-compose up -d
 ### 备份和恢复
 
 ```bash
-# 备份所有模型
+# 推荐工作流：备份所有模型
 ./omo.sh --backup-all
 
-# 恢复特定模型
-./omo.sh --restore backups/qwen2.5_7b-instruct_20241201_123456.tar.gz
+# 安装时会自动检查并从备份恢复
+# 这是推荐的方式 - 无需手动恢复
+./omo.sh --install
+
+# 手动恢复（仅在自动恢复失效时使用）
+./omo.sh --restore qwen2.5_7b-instruct
 
 # 强制恢复（覆盖现有）
-./omo.sh --force --restore backups/model_backup.tar.gz
+./omo.sh --force --restore qwen2.5_7b-instruct
 ```
 
 ## 🚨 错误处理

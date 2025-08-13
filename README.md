@@ -26,7 +26,8 @@
 
 - **Complete Backup**: Full model backup including manifests and blob files
 - **Integrity Verification**: MD5 checksum validation for backup integrity
-- **Flexible Restore**: Restore models from backup archives
+- **Auto-Restore**: `--install` automatically checks and restores from backup before downloading
+- **Manual Restore**: Direct restore from backup (use only when needed)
 - **Batch Operations**: Backup or restore multiple models
 
 ### 🐳 Docker Integration
@@ -58,10 +59,12 @@ cd omo
 chmod +x omo.sh
 ```
 
-3. Create your models list file:
+3. Edit the models list file:
 
 ```bash
-touch models.list
+# Edit models.list to add your desired models
+# The repository includes a template with examples
+vim models.list
 ```
 
 ### Basic Usage
@@ -77,22 +80,23 @@ touch models.list
 ./omo.sh --list
 
 # Backup a specific model
-./omo.sh --backup qwen2.5:7b-instruct
+./omo.sh --backup ollama:qwen2.5:7b-instruct
 
 # Backup all models
 ./omo.sh --backup-all
 
-# Restore from backup
-./omo.sh --restore /path/to/backup.tar.gz
+# Restore from backup (manual, not recommended)
+# Note: --install automatically restores from backup if available
+./omo.sh --restore qwen2.5_7b-instruct
 
 # Remove a model
 ./omo.sh --remove deepseek-r1:1.5b
 
+# Remove all models
+./omo.sh --remove-all
+
 # Generate Docker Compose
 ./omo.sh --generate-compose
-
-# Force operations (skip confirmations)
-./omo.sh --force --install
 ```
 
 ## 📝 Model Configuration
@@ -208,7 +212,7 @@ export VERBOSE="true"
 ./omo.sh --list
 
 # 4. Backup important models
-./omo.sh --backup qwen2.5:7b-instruct
+./omo.sh --backup ollama:qwen2.5:7b-instruct
 
 # 5. Generate Docker Compose for deployment
 ./omo.sh --generate-compose
@@ -220,14 +224,18 @@ docker-compose up -d
 ### Backup and Restore
 
 ```bash
-# Backup all models
+# Recommended workflow: Backup all models
 ./omo.sh --backup-all
 
-# Restore specific model
-./omo.sh --restore backups/qwen2.5_7b-instruct_20241201_123456.tar.gz
+# Install will automatically restore from backup if available
+# This is the recommended way - no manual restore needed
+./omo.sh --install
+
+# Manual restore (only use when auto-restore doesn't work)
+./omo.sh --restore qwen2.5_7b-instruct
 
 # Force restore (overwrite existing)
-./omo.sh --force --restore backups/model_backup.tar.gz
+./omo.sh --force --restore qwen2.5_7b-instruct
 ```
 
 ## 🚨 Error Handling
