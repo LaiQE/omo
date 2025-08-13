@@ -2075,9 +2075,13 @@ remove_models_from_list() {
 update_existing_compose() {
 	local output_file="$1"
 	local custom_models="$2"
-	local default_model="$3"
+	local default_original_model="$3"
 
 	log_info "Updating CUSTOM_MODELS configuration in existing docker-compose.yaml file"
+
+	# Generate simplified model name for DEFAULT_MODEL
+	local default_model
+	default_model=$(get_safe_model_name "${default_original_model}" "ollama")
 
 	# Confirm overwrite with user
 	log_warning "The file ${output_file} will be overwritten."
@@ -2129,9 +2133,20 @@ update_existing_compose() {
 		return 1
 	fi
 
+	# Update VITE_CUSTOM_API_MODEL line if it exists
+	if grep -q "VITE_CUSTOM_API_MODEL=" "${output_file}"; then
+		if ! sed -E "s|(^[[:space:]]*-[[:space:]]*VITE_CUSTOM_API_MODEL=)[^[:space:]#]*(.*)|\\1${default_original_model}  # Auto-set to first model from models.list|" "${output_file}" >"${temp_file}"; then
+			log_error "Failed to update VITE_CUSTOM_API_MODEL configuration"
+			return 1
+		fi
+		# Copy back the updated content
+		cp "${temp_file}" "${output_file}"
+	fi
+
 	log_success "Successfully updated docker-compose.yaml configuration"
 	log_verbose "Updated models: ${custom_models}"
-	log_verbose "Updated default model: ${default_model}"
+	log_verbose "Updated default model (simplified): ${default_model}"
+	log_verbose "Updated default model (original): ${default_original_model}"
 
 	# Clean up temporary file
 	rm -f "${temp_file}"
@@ -2150,8 +2165,8 @@ generate_docker_compose() {
 	fi
 
 	# Parse models configuration in one pass
-	local custom_models_content default_model
-	parse_models_configuration "${models_file}" custom_models_content default_model
+	local custom_models_content default_original_model
+	parse_models_configuration "${models_file}" custom_models_content default_original_model
 
 	# Validate generated configuration
 	if [[ -z ${custom_models_content} ]]; then
@@ -2161,15 +2176,15 @@ generate_docker_compose() {
 	fi
 
 	log_verbose "Generated CUSTOM_MODELS: ${custom_models_content}"
-	log_verbose "Detected default model: ${default_model}"
+	log_verbose "Detected default model: ${default_original_model}"
 
 	# Handle existing vs new file
 	if [[ -f ${output_file} && -s ${output_file} ]]; then
 		log_info "Updating existing docker-compose.yaml configuration"
-		update_existing_compose "${output_file}" "${custom_models_content}" "${default_model}"
+		update_existing_compose "${output_file}" "${custom_models_content}" "${default_original_model}"
 	else
 		log_info "Generating new docker-compose.yaml from model list: ${models_file}"
-		generate_compose_content "${output_file}" "${custom_models_content}" "${default_model}"
+		generate_compose_content "${output_file}" "${custom_models_content}" "${default_original_model}"
 	fi
 }
 
@@ -2177,7 +2192,7 @@ generate_docker_compose() {
 parse_models_configuration() {
 	local models_file="$1"
 	local -n custom_models_ref=$2
-	local -n default_model_ref=$3
+	local -n default_original_model_ref=$3
 
 	# Use existing parse_models_list function to get validated model entries
 	# Suppress verbose logging during compose generation
@@ -2191,12 +2206,12 @@ parse_models_configuration() {
 
 	if [[ ${parse_result} -ne 0 ]]; then
 		custom_models_ref=""
-		default_model_ref="qwen3-14b"
+		default_original_model_ref="qwen3:14b"
 		return 1
 	fi
 
 	local custom_models_entries=("-all") # Start with -all to hide default models
-	local first_active_model=""
+	local first_original_model=""
 
 	# Process each validated model entry
 	for model_entry in "${models_array[@]}"; do
@@ -2205,11 +2220,11 @@ parse_models_configuration() {
 			# Generate alias and custom model entry
 			local model_spec="${model_info[name]}:${model_info[tag]}"
 			local alias
-			alias=$(generate_model_alias "${model_spec}" "${model_info[type]}")
+			alias=$(get_safe_model_name "${model_spec}" "ollama")
 			custom_models_entries+=("+${model_spec}@OpenAI=${alias}")
 
 			# Set first active model as default if not set
-			[[ -z ${first_active_model} ]] && first_active_model="${alias}"
+			[[ -z ${first_original_model} ]] && first_original_model="${model_spec}"
 		fi
 	done
 
@@ -2224,58 +2239,11 @@ parse_models_configuration() {
 		custom_models_ref="" # No active models found
 	fi
 
-	# Set default model (passed by reference)
+	# Set default original model (passed by reference)
 	# shellcheck disable=SC2034
-	default_model_ref="${first_active_model:-qwen3-14b}"
+	default_original_model_ref="${first_original_model:-qwen3:14b}"
 }
 
-# 生成简单的模型别名
-generate_model_alias() {
-	local model_spec="$1"
-	local model_type="$2"
-
-	# 根据模型类型提取实际的模型名称
-	local model_name=""
-	local model_version=""
-
-	case "${model_type}" in
-	"hf-gguf")
-		# 对于 hf-gguf 模型，从路径中提取模型名称
-		# 格式如: hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
-		if [[ ${model_spec} =~ hf\.co/[^/]+/([^/:]+) ]]; then
-			model_name="${BASH_REMATCH[1]}"
-			# 移除常见的 GGUF 后缀
-			model_name=$(echo "${model_name}" | sed 's/-GGUF$//' | sed 's/_GGUF$//')
-		fi
-		;;
-	*)
-		# 对于 ollama 和其他类型，使用基础名称
-		model_name="${model_spec%:*}"
-		;;
-	esac
-
-	# 从模型规格中提取版本信息
-	if [[ ${model_spec} =~ :(.+)$ ]]; then
-		model_version="${BASH_REMATCH[1]}"
-	fi
-
-	# 如果没有提取到模型名称，使用类型作为后备
-	if [[ -z ${model_name} ]]; then
-		model_name="${model_type}"
-	fi
-
-	# 清理模型名称和版本中的特殊字符
-	local clean_name
-	clean_name=$(echo "${model_name}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
-
-	if [[ -n ${model_version} && ${model_version} != "latest" ]]; then
-		local clean_version
-		clean_version=$(echo "${model_version}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9.]/-/g' | sed 's/--*/-/g' | sed 's/^-\|-$//g')
-		echo "${clean_name}-${clean_version}"
-	else
-		echo "${clean_name}"
-	fi
-}
 
 # Detect available GPU devices
 detect_gpus() {
@@ -2296,12 +2264,15 @@ detect_gpus() {
 generate_compose_content() {
 	local output_file="$1"
 	local custom_models="$2"
-	local default_model="$3"
+	local default_original_model="$3"
 
-	local cuda_devices host_timezone
+	local cuda_devices host_timezone default_model
 	cuda_devices=$(detect_gpus)
 	host_timezone=$(get_host_timezone)
 	[[ -z ${host_timezone} ]] && host_timezone="UTC"
+
+	# Generate simplified model name for DEFAULT_MODEL
+	default_model=$(get_safe_model_name "${default_original_model}" "ollama")
 
 	# Generate docker-compose.yaml content
 	cat >"${output_file}" <<EOF
@@ -2358,7 +2329,7 @@ services:
     environment:
       - VITE_CUSTOM_API_BASE_URL=http://YOUR_SERVER_IP:3001/v1  # Replace with your server IP
       - VITE_CUSTOM_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx  # Replace with your API key
-      - VITE_CUSTOM_API_MODEL=${default_model}  # Auto-set to first model from models.list
+      - VITE_CUSTOM_API_MODEL=${default_original_model}  # Auto-set to first model from models.list
       - ACCESS_USERNAME=admin  # Replace with your username
       - ACCESS_PASSWORD=xxxxxxxxxxxxxxxxxxxxxx  # Replace with your password
     networks:
@@ -2395,7 +2366,8 @@ EOF
 
 	log_success "Successfully generated docker-compose.yaml: ${output_file}"
 	log_verbose "Model configuration: ${custom_models}"
-	log_verbose "Default model: ${default_model}"
+	log_verbose "Default model (simplified): ${default_model}"
+	log_verbose "Default model (original): ${default_original_model}"
 	log_verbose "Detected GPU devices: ${cuda_devices}"
 	echo ""
 	log_info "⚠️  Important: The generated configuration contains placeholders that require modification:"
@@ -2405,7 +2377,8 @@ EOF
 	log_info "3. ACCESS_USERNAME/ACCESS_PASSWORD: Set login credentials for prompt-optimizer"
 	log_info "4. OPENAI_API_KEY: Replace with valid API key from one-api"
 	log_info "5. CODE: Set access password for ChatGPT-Next-Web"
-	log_info "6. VITE_CUSTOM_API_MODEL/DEFAULT_MODEL: Auto-set to ${default_model}, modify as needed"
+	log_info "6. VITE_CUSTOM_API_MODEL: Auto-set to ${default_original_model}"
+	log_info "7. DEFAULT_MODEL: Auto-set to ${default_model}, modify as needed"
 	echo ""
 	log_info "== Optional Configuration Changes =="
 	log_info "• Port mappings: Modify host ports to avoid conflicts"
@@ -2787,12 +2760,10 @@ main() {
 	log_info "Processed: ${processed}"
 	if [[ ${failed} -gt 0 ]]; then
 		log_warning "Failed: ${failed}"
-	else
-		log_success "All completed successfully"
 	fi
 
 	if [[ ${CHECK_ONLY} == "true" ]]; then
-		log_info "Check mode completed, no actual downloads performed"
+		log_warning "Check mode completed, no actual downloads performed"
 	fi
 }
 
