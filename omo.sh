@@ -2106,15 +2106,24 @@ update_existing_compose() {
 
 	# Update CUSTOM_MODELS line - use line-by-line processing
 	local found_custom_models=false
+	local in_custom_models_block=false
 
 	while IFS= read -r line; do
 		if [[ ${line} =~ ^[[:space:]]*-[[:space:]]*\"?CUSTOM_MODELS= ]]; then
 			# Found CUSTOM_MODELS line, replace it completely
 			echo "      - \"CUSTOM_MODELS=${custom_models}\""
 			found_custom_models=true
-		elif [[ ${found_custom_models} == true ]] && [[ ${line} =~ ^[[:space:]]+[^-] ]] && [[ ! ${line} =~ ^[[:space:]]*-[[:space:]]* ]]; then
-			# Skip continuation lines of previous CUSTOM_MODELS (indented lines that are not new env vars)
-			continue
+			in_custom_models_block=true
+		elif [[ ${in_custom_models_block} == true ]]; then
+			# Check if this is a continuation line of CUSTOM_MODELS (starts with spaces and contains model config)
+			if [[ ${line} =~ ^[[:space:]]+[+@=] ]] || [[ ${line} =~ ^[[:space:]]+.*\"[[:space:]]*$ ]]; then
+				# This is a continuation line of CUSTOM_MODELS, skip it
+				continue
+			else
+				# Not a continuation line, exit the CUSTOM_MODELS block
+				in_custom_models_block=false
+				echo "${line}"
+			fi
 		else
 			# Regular line - output as is
 			echo "${line}"
