@@ -1,56 +1,47 @@
-# OMO (Oh-My-Ollama)
+# OMO (Oh-My-Ollama / Ollama Model Organizer)
 
-🤖 **Ollama Models Organizer** - A comprehensive tool for managing Ollama models with advanced features.
+🤖 **Docker-based tool for managing Ollama models with backup and compose generation.**
 
 [![GitHub](https://img.shields.io/badge/GitHub-Repository-blue?logo=github)](https://github.com/LaiQE/omo)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Shell Script](https://img.shields.io/badge/Shell-Bash-blue.svg)](https://www.gnu.org/software/bash/)
+[![Docker](https://img.shields.io/badge/Docker-Ready-blue?logo=docker)](https://www.docker.com/)
 
 **Language**: [English](README.md) | [中文](README_CN.md)
 
+## 🌟 What is OMO?
+
+**OMO** (Oh-My-Ollama / Ollama Model Organizer) is a Docker-based shell script for managing [Ollama](https://ollama.ai/) models. It provides essential model lifecycle operations including download, backup, restore, and removal, plus generates Docker Compose configurations for production deployments.
+
 ## ✨ Features
 
-### 📥 Model Download
+### 📥 Model Management
 
-- **Ollama Official Models**: Download models directly from Ollama repository
-- **HuggingFace GGUF**: Direct import of GGUF format models from HuggingFace
-- **Resume Downloads**: Intelligent breakpoint resumption and cache reuse
-
-### 💾 Model Backup & Restore
-
-- **Complete Backup**: Full Ollama model backup (manifest + blobs)
-- **Integrity Check**: MD5 checksum verification for data integrity
-- **Detailed Reports**: Generate comprehensive backup information files
-- **Force Recovery**: Support for force overwrite mode during restoration
-
-### 📋 Model Management
-
+- **Download Models**: Install models from Ollama registry or HuggingFace repositories (only GGUF)
 - **List Models**: Display installed models with detailed information
-- **Smart Deletion**: Intelligent model deletion (single/batch)
-- **Integrity Verification**: Model completeness check and validation
-- **Disk Usage**: Storage utilization statistics
+- **Remove Models**: Delete models individually or in batch
+- **Model Verification**: Check model integrity after operations
 
-### 🐳 Containerized Deployment
+### 💾 Backup & Restore
 
-- **Docker Compose**: Generate Docker Compose configurations
-- **Service Integration**: Integrate Ollama, One-API, Prompt-Optimizer services
-- **GPU Support**: Automatic GPU detection and configuration
-- **Smart Configuration**: Intelligent port and network setup
+- **Complete Backup**: Full model backup including manifests and blob files
+- **Integrity Verification**: MD5 checksum validation for backup integrity
+- **Flexible Restore**: Restore models from backup archives
+- **Batch Operations**: Backup or restore multiple models
 
-### ⚙️ Advanced Features
+### 🐳 Docker Integration
 
-- **Custom Quantization**: Support multiple quantization types (q4_0, q5_0, q8_0, etc.)
-- **Dynamic Docker**: Dynamic Docker image building
-- **Parallel Processing**: Optimized caching and parallel execution
-- **Comprehensive Logging**: Detailed logging and error handling
+- **Compose Generation**: Create Docker Compose configurations
+- **Multi-Service Stack**: Integrated Ollama, One-API, and Open-WebUI services
+- **GPU Support**: Automatic NVIDIA GPU detection and configuration
+- **Production Ready**: Proper volume management and networking
 
 ## 🚀 Quick Start
 
 ### Prerequisites
 
-- **Docker** with GPU support (for CUDA acceleration)
-- **rsync** for file synchronization
-- **bash** shell environment
+- **Docker**: Required for all operations
+- **nvidia gpu**: for GPU acceleration
 
 ### Installation
 
@@ -67,7 +58,7 @@ cd omo
 chmod +x omo.sh
 ```
 
-3. Create your models list file (see [Model File Format](#-model-file-format)):
+3. Create your models list file:
 
 ```bash
 touch models.list
@@ -79,141 +70,178 @@ touch models.list
 # Show help
 ./omo.sh --help
 
-# Download models from models.list
-./omo.sh
-
-# Use custom models file
-./omo.sh --models-file my-models.list
-
-# Backup a specific model
-./omo.sh --backup deepseek-r1:1.5b
-
-# Backup all models
-./omo.sh --backup-all
-
-# Restore a model
-./omo.sh --restore deepseek-r1:1.5b
+# Install missing models from models.list
+./omo.sh --install
 
 # List installed models
 ./omo.sh --list
 
-# Delete a model
-./omo.sh --delete deepseek-r1:1.5b
+# Backup a specific model
+./omo.sh --backup qwen2.5:7b-instruct
 
-# Force download (ignore existing)
-./omo.sh --force
+# Backup all models
+./omo.sh --backup-all
+
+# Restore from backup
+./omo.sh --restore /path/to/backup.tar.gz
+
+# Remove a model
+./omo.sh --remove deepseek-r1:1.5b
 
 # Generate Docker Compose
-./omo.sh --docker-compose
+./omo.sh --generate-compose
+
+# Force operations (skip confirmations)
+./omo.sh --force --install
 ```
 
-## 📝 Model File Format
+## 📝 Model Configuration
 
 Create a `models.list` file with one model per line:
 
+```text
+# Ollama registry models
+ollama:deepseek-r1:1.5b
+ollama:llama3.2:3b
+ollama:qwen2.5:7b-instruct
+
+# HuggingFace GGUF models
+hf-gguf:hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
+hf-gguf:hf.co/MaziyarPanahi/gemma-3-1b-it-GGUF:q4_0
+
+# Comments and empty lines are ignored
+# Add your own models here
 ```
-# Ollama official models
-ollama deepseek-r1:1.5b
-ollama llama3.2:3b
 
-# HuggingFace GGUF models (direct import)
-hf-gguf hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest
-hf-gguf hf.co/MaziyarPanahi/gemma-3-1b-it-GGUF
-```
+### Supported Formats
 
-### Model Format Types
-
-| Format    | Description                    | Example                                                     |
-| --------- | ------------------------------ | ----------------------------------------------------------- |
-| `ollama`  | Official Ollama models         | `ollama deepseek-r1:1.5b`                                   |
-| `hf-gguf` | HF GGUF models (direct import) | `hf-gguf hf.co/bartowski/Llama-3.2-1B-Instruct-GGUF:latest` |
+| Format              | Description             | Example                           |
+| ------------------- | ----------------------- | --------------------------------- |
+| `ollama:model:tag`  | Official Ollama models  | `ollama:llama3.2:3b`              |
+| `hf-gguf:repo:file` | HuggingFace GGUF models | `hf-gguf:hf.co/author/model:file` |
 
 ## 📁 Directory Structure
 
-```
+```text
 omo/
-├── omo.sh                    # Main script
-├── models.list               # Model definitions
-├── ollama/                   # Ollama data directory
-│   └── models/              # Ollama models storage
-├── backups/                 # Model backups
-└── docker/                 # Docker build contexts (temporary)
+├── omo.sh              # Main script
+├── models.list         # Model configuration
+├── ollama/            # Ollama data directory
+│   └── models/        # Model storage
+├── backups/           # Model backups
+└── docker-compose.yml # Generated compose file (optional)
 ```
 
 ## 🛠️ Command Line Options
 
-| Option                    | Description                    | Default         |
-| ------------------------- | ------------------------------ | --------------- |
-| `--models-file FILE`      | Specify models list file       | `./models.list` |
-| `--ollama-dir DIR`        | Ollama data directory          | `./ollama`      |
-| `--backup-output-dir DIR` | Backup output directory        | `./backups`     |
-| `--backup MODEL`          | Backup specific model          | -               |
-| `--backup-all`            | Backup all models              | -               |
-| `--restore MODEL`         | Restore specific model         | -               |
-| `--list`                  | List installed models          | -               |
-| `--delete MODEL`          | Delete specific model          | -               |
-| `--force`                 | Force download/overwrite       | -               |
-| `--docker-compose`        | Generate Docker Compose config | -               |
-| `--rebuild`               | Force rebuild Docker images    | -               |
-| `--verbose`               | Enable verbose logging         | -               |
-| `--help`                  | Show help information          | -               |
+### Core Commands
 
-## 🐳 Docker Integration
+| Option               | Description                  |
+| -------------------- | ---------------------------- |
+| `--install`          | Download missing models      |
+| `--check-only`       | Check status only (default)  |
+| `--force-download`   | Force re-download all models |
+| `--list`             | List installed models        |
+| `--backup MODEL`     | Backup specific model        |
+| `--backup-all`       | Backup all models            |
+| `--restore FILE`     | Restore from backup          |
+| `--remove MODEL`     | Remove specific model        |
+| `--remove-all`       | Remove all models            |
+| `--generate-compose` | Generate docker-compose.yml  |
 
-OMO can generate a complete Docker Compose setup with integrated services:
+### Configuration Options
+
+| Option               | Description            | Default         |
+| -------------------- | ---------------------- | --------------- |
+| `--models-file FILE` | Model list file        | `./models.list` |
+| `--ollama-dir DIR`   | Ollama data directory  | `./ollama`      |
+| `--backup-dir DIR`   | Backup directory       | `./backups`     |
+| `--verbose`          | Enable verbose logging | -               |
+| `--force`            | Skip confirmations     | -               |
+
+## 🐳 Docker Compose Integration
+
+Generate a complete Docker stack:
 
 ```bash
-./omo.sh --docker-compose
+./omo.sh --generate-compose
 ```
 
 This creates a `docker-compose.yml` with:
 
-- **Ollama**: Core LLM runtime with GPU support
-- **One-API**: API gateway for multiple LLM providers
-- **Prompt-Optimizer**: Prompt optimization service
-- **ChatGPT-Next-Web**: Web interface for chat interactions
+| Service        | Port  | Description                    |
+| -------------- | ----- | ------------------------------ |
+| **Ollama**     | 11434 | Model runtime with GPU support |
+| **One-API**    | 3000  | API gateway and management     |
+| **Open-WebUI** | 3001  | Web interface for chat         |
 
-### Generated Services
+**External References:**
 
-| Service          | Port  | Description           |
-| ---------------- | ----- | --------------------- |
-| Ollama           | 11434 | LLM runtime API       |
-| One-API          | 3000  | API gateway dashboard |
-| Prompt-Optimizer | 8080  | Prompt optimization   |
-| ChatGPT-Next-Web | 3001  | Web chat interface    |
+- [Ollama](https://ollama.ai/) - AI model runtime
+- [One-API](https://github.com/songquanpeng/one-api) - OpenAI API gateway
+- [Open-WebUI](https://github.com/open-webui/open-webui) - Web interface
 
-## 🔧 Advanced Configuration
+## 🔧 Configuration
 
 ### Environment Variables
 
 ```bash
-
-# Verbose logging
+# Enable verbose logging
 export VERBOSE="true"
+
+# Use custom directories
+./omo.sh --ollama-dir /custom/ollama --backup-dir /custom/backups
 ```
 
-### Custom Directories
+## 📋 Examples
+
+### Model Management Workflow
 
 ```bash
-# Use custom directories
-./omo.sh \
-  --ollama-dir /custom/ollama \
-  --backup-output-dir /custom/backups \
+# 1. Check what models need to be downloaded
+./omo.sh --check-only
+
+# 2. Install missing models
+./omo.sh --install
+
+# 3. List all installed models
+./omo.sh --list
+
+# 4. Backup important models
+./omo.sh --backup qwen2.5:7b-instruct
+
+# 5. Generate Docker Compose for deployment
+./omo.sh --generate-compose
+
+# 6. Start the stack
+docker-compose up -d
+```
+
+### Backup and Restore
+
+```bash
+# Backup all models
+./omo.sh --backup-all
+
+# Restore specific model
+./omo.sh --restore backups/qwen2.5_7b-instruct_20241201_123456.tar.gz
+
+# Force restore (overwrite existing)
+./omo.sh --force --restore backups/model_backup.tar.gz
 ```
 
 ## 🚨 Error Handling
 
-OMO includes comprehensive error handling:
+OMO includes basic error handling for:
 
-- **Network Issues**: Automatic retry with exponential backoff
-- **Disk Space**: Pre-flight disk space validation
-- **Corrupted Downloads**: Automatic integrity verification
-- **Docker Issues**: Detailed container diagnostics
-- **Permission Problems**: Clear permission requirement messages
+- **Network Issues**: Clear error messages for download failures
+- **Docker Problems**: Docker daemon status verification
+- **File Integrity**: MD5 checksum validation for backups
+- **Model Conflicts**: Confirmation prompts for destructive operations
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please feel free to:
+Contributions are welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch
@@ -226,8 +254,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 🙏 Acknowledgments
 
-- [Ollama](https://ollama.ai/) - For the excellent LLM runtime
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) - For model quantization tools
+- **[Ollama](https://ollama.ai/)** - Excellent LLM runtime platform
+- **[Docker](https://docker.com/)** - Containerization platform
 
 ## 📞 Support
 
@@ -237,4 +265,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 **Author**: Chain Lai  
-**Repository**: https://github.com/LaiQE/omo
+**Repository**: <https://github.com/LaiQE/omo>

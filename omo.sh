@@ -1,48 +1,58 @@
 #!/bin/bash
 # =============================================================================
-# OMO (oh-my-ollama or Ollama Models Organizer)
+# OMO (Oh-My-Ollama / Ollama模型组织器)
+# 基于Docker的Ollama模型管理工具
 # =============================================================================
 #
-# 🤖 功能概览：
-#   📥 模型下载：
+# 🤖 主要功能:
+#
+#   📥 模型管理:
 #       • 从Ollama官方仓库下载模型
-#       • 直接下载HuggingFace的GGUF格式模型
+#       • 下载HuggingFace GGUF格式模型
+#       • 列出已安装模型的详细信息
+#       • 删除模型（单个/批量操作）
+#       • 模型完整性验证
 #
-#   💾 模型备份：
-#       • 完整备份Ollama模型（manifest + blobs）
-#       • MD5校验确保数据完整性
-#       • 生成详细备份信息文件
+#   💾 备份与恢复:
+#       • 完整模型备份（manifest + blob文件）
+#       • MD5校验和验证确保数据完整性
+#       • 从备份档案恢复模型
+#       • 支持单个模型和批量备份操作
+#       • 强制覆盖模式
 #
-#   🔄 模型恢复：
-#       • 从备份恢复Ollama模型
-#       • 支持强制覆盖模式
-#       • 自动验证文件完整性
+#   🐳 Docker Compose集成:
+#       • 生成Docker Compose配置文件
+#       • 多服务堆栈（Ollama + One-API + Open-WebUI）
+#       • 自动NVIDIA GPU检测和配置
+#       • 主机时区同步
+#       • 卷管理和网络配置
 #
-#   📋 模型管理：
-#       • 列出已安装模型及详细信息
-#       • 智能删除模型（单个/批量）
-#       • 模型完整性检查和验证
-#       • 磁盘使用情况统计
+#   🛠️ 系统功能:
+#       • 依赖检查和验证
+#       • GPU支持检测
+#       • Docker容器生命周期管理
+#       • 详细日志记录和错误处理
+#       • 资源清理功能
 #
-#   🐳 容器化部署：
-#       • 生成Docker Compose配置
-#       • 集成Ollama、One-API、Prompt-Optimizer等服务
-#       • 自动GPU支持和时区配置
-#       • 智能端口和网络配置
+# 📝 支持的模型格式:
+#   • ollama:模型名:标签     - Ollama仓库模型
+#   • hf-gguf:仓库:文件     - HuggingFace GGUF模型
 #
-#   ⚙️  高级特性：
-#       • 并行处理和缓存优化
-#       • 详细日志和错误处理
+# 🔧 系统要求:
+#   • Docker引擎（必需）
+#   • nvidia-smi（可选，用于GPU加速）
+#   • 标准UNIX工具（bash、md5sum等）
 #
-# 📝 支持的模型格式：
-#   • ollama [model]:[tag]     - Ollama官方模型
-#   • hf-gguf [model]:[tag]    - HuggingFace GGUF模型(直接导入)
+# 📖 使用示例:
+#   ./omo.sh --install                    # 下载缺失的模型
+#   ./omo.sh --backup qwen2.5:7b-instruct # 备份特定模型
+#   ./omo.sh --restore backup.tar.gz      # 从备份恢复
+#   ./omo.sh --list                       # 列出已安装模型
+#   ./omo.sh --generate-compose           # 生成Docker Compose
 #
-# 🔧 环境要求：
-#   • Docker, nvidia gpu, rsync
-#
-# 👨‍💻 作者：Chain Lai
-# 📖 详细使用说明请运行：./omo.sh --help
+# 👨‍💻 作者: Chain Lai
+# 📚 文档: ./omo.sh --help
+# 🔗 仓库: https://github.com/LaiQE/omo
 # =============================================================================
 
 set -euo pipefail # 启用严格的错误处理
@@ -727,7 +737,6 @@ add_cleanup_function() {
 	fi
 }
 
-# 执行所有清理函数
 execute_global_cleanup() {
 	local exit_code=$?
 	local func
@@ -1191,7 +1200,6 @@ download_model() {
 	esac
 }
 
-# 下载Ollama模型
 download_ollama_model() {
 	local model_name="$1"
 	local model_tag="$2"
@@ -1373,7 +1381,6 @@ backup_ollama_model() {
 	log_verbose_success "Model backup completed: ${model_spec}"
 	return 0
 }
-# 备份单个模型的包装函数
 
 backup_single_model() {
 	local -n model_info_ref=$1
@@ -1389,7 +1396,6 @@ backup_single_model() {
 	esac
 }
 
-# 自动识别备份类型并恢复
 # 批量备份模型（根据models.list文件）
 backup_models_from_list() {
 	local models_file="$1"
@@ -1476,8 +1482,8 @@ backup_models_from_list() {
 		return 1
 	fi
 }
-# 创建备份信息文件
 
+# 创建备份信息文件
 create_backup_info() {
 	local model_spec="$1"
 	local backup_base="$2"
@@ -1690,7 +1696,6 @@ try_restore_model() {
 }
 
 # 内部函数：自动恢复实现
-
 _auto_restore_from_backup() {
 	local model_name="$1"
 	local model_tag="$2"
@@ -1721,7 +1726,6 @@ _auto_restore_from_backup() {
 }
 
 # 内部函数：Ollama模型恢复的核心实现
-
 _restore_ollama_implementation() {
 	local backup_dir="$1"
 	local force_restore="${2:-false}"
@@ -1768,7 +1772,6 @@ _restore_ollama_implementation() {
 }
 
 # 内部函数：验证备份结构
-
 _validate_backup_structure() {
 	local backup_dir="$1"
 
@@ -1798,7 +1801,6 @@ _validate_backup_structure() {
 }
 
 # 内部函数：验证备份完整性
-
 _verify_backup_integrity() {
 	local backup_dir="$1"
 	local force_restore="$2"
@@ -1827,7 +1829,6 @@ _verify_backup_integrity() {
 }
 
 # 内部函数：检查恢复冲突
-
 _check_restore_conflicts() {
 	local backup_dir="$1"
 	local force_restore="$2"
@@ -1976,7 +1977,6 @@ remove_ollama_model() {
 }
 
 # 批量删除模型（根据models.list文件）
-
 remove_models_from_list() {
 	local models_file="$1"
 	local force_delete="${2:-false}"
@@ -2071,7 +2071,6 @@ remove_models_from_list() {
 # 14. compose生成模块 (Docker Compose File)
 #=============================================
 
-# 生成docker-compose.yaml文件
 update_existing_compose() {
 	local output_file="$1"
 	local custom_models="$2"
@@ -2243,7 +2242,6 @@ parse_models_configuration() {
 	# shellcheck disable=SC2034
 	default_original_model_ref="${first_original_model:-qwen3:14b}"
 }
-
 
 # Detect available GPU devices
 detect_gpus() {
@@ -2477,8 +2475,6 @@ execute_task() {
 	fi
 }
 
-# 模型处理器 - 解析模型条目并返回处理函数
-
 show_help() {
 	cat <<'EOF'
 🤖 OMO - Oh-My-Ollama or Ollama-Models-Organizer
@@ -2527,8 +2523,8 @@ DEPENDENCIES:
 GitHub: https://github.com/LaiQE/omo
 EOF
 }
-# 主函数
 
+# 主函数
 main() {
 	# 检查参数 - 支持help在任何位置
 	for arg in "$@"; do
